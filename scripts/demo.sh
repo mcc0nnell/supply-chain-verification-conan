@@ -24,21 +24,23 @@ mkdir -p "$ROOT/demo"
 conan assurance \
   --requires=zlib/1.3.1 \
   -r=conancenter \
-  --materialize-packages \
-  --verify-source-bytes \
-  --verify-package-bytes \
+  --rebuild-package=zlib/1.3.1 \
+  --rebuild-count=2 \
   --report="$ROOT/demo/assurance.ndjson" \
   --receipt="$ROOT/demo/receipt.json" \
+  --provenance="$ROOT/demo/provenance.json" \
   --format=json > "$ROOT/demo/assurance.json"
 
-python3 - "$ROOT/demo/assurance.json" "$ROOT/demo/receipt.json" <<'PY'
+python3 - "$ROOT/demo/assurance.json" "$ROOT/demo/receipt.json" "$ROOT/demo/provenance.json" <<'PY'
 import json
 import sys
 
 path = sys.argv[1]
 receipt_path = sys.argv[2]
+provenance_path = sys.argv[3]
 data = json.load(open(path, encoding="utf-8"))
 receipt = json.load(open(receipt_path, encoding="utf-8"))
+provenance = json.load(open(provenance_path, encoding="utf-8"))
 items = data["evidence"]
 
 def find(check):
@@ -51,12 +53,16 @@ revision = find("recipe-revision")
 digest = find("source-digest")
 source_bytes = find("source-artifact-bytes")
 package_bytes = find("package-bytes")
+repeatability = find("rebuild-repeatability")
+reproduction = find("consumed-binary-reproduction")
 scorecard = find("openssf-scorecard")
 
 assert revision["status"] == "PASS", revision
 assert digest["status"] == "PASS", digest
 assert source_bytes["status"] == "PASS", source_bytes
 assert package_bytes["status"] == "PASS", package_bytes
+assert repeatability["status"] == "PASS", repeatability
+assert reproduction["status"] in ("PASS", "FAIL"), reproduction
 assert scorecard["status"] == "PASS", scorecard
 assert any(
     "github.com/madler/zlib" in value for value in scorecard["locations"]
@@ -69,8 +75,16 @@ assert package["package_id"], package
 assert package["package_revision"], package
 assert package["source_artifact_sha256"], package
 assert package["package_tree_sha256"], package
+assert package["package_payload_sha256"], package
 assert len(receipt["graph_sha256"]) == 64, receipt
 assert len(receipt["evidence_sha256"]) == 64, receipt
+
+rebuild = provenance["rebuilds"][0]
+assert rebuild["reference"] == "zlib/1.3.1", rebuild
+assert rebuild["repeatable"] is True, rebuild
+assert len(set(rebuild["rebuild_payload_sha256"])) == 1, rebuild
+assert len(rebuild["rebuild_payload_sha256"]) == 2, rebuild
+assert len(rebuild["consumed_payload_sha256"]) == 64, rebuild
 
 print(
     f"packages={data['packages']} observations={data['observations']} "
@@ -78,4 +92,8 @@ print(
     f"unknown={data['counts']['UNKNOWN']}"
 )
 print(scorecard["summary"])
+print(repeatability["summary"])
+print(reproduction["summary"])
+print("consumed payload:", rebuild["consumed_payload_sha256"])
+print("clean rebuild payload:", rebuild["rebuild_payload_sha256"][0])
 PY

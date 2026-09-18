@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import urllib.error
 import urllib.request
@@ -36,6 +38,21 @@ class Evidence:
         value = asdict(self)
         value["locations"] = list(self.locations)
         return value
+
+
+@dataclass(frozen=True)
+class RebuildRecord:
+    reference: str
+    recipe_revision: str
+    consumed_package_id: str
+    consumed_package_revision: str
+    consumed_payload_sha256: str
+    rebuild_payload_sha256: tuple[str, ...]
+    rebuild_package_revisions: tuple[str, ...]
+    rebuild_log_sha256: tuple[str, ...]
+    repeatable: bool
+    matches_consumed: bool
+    builder: dict
 
 
 def _format_json(result):
@@ -128,12 +145,34 @@ def assurance(conan_api, parser, *args):
         help="Hash cached package file trees and bind them to package ID/revision",
     )
     parser.add_argument(
+        "--rebuild-package",
+        action="append",
+        default=[],
+        help="Rebuild this resolved name/version in clean Conan homes (repeatable)",
+    )
+    parser.add_argument(
+        "--rebuild-count",
+        type=int,
+        default=2,
+        help="Number of independent clean-cache rebuilds (default: 2)",
+    )
+    parser.add_argument(
+        "--rebuild-timeout",
+        type=int,
+        default=900,
+        help="Timeout for each clean rebuild in seconds (default: 900)",
+    )
+    parser.add_argument(
         "--report",
         help="Write deterministic NDJSON evidence to this path before policy enforcement",
     )
     parser.add_argument(
         "--receipt",
         help="Write a deterministic JSON receipt binding graph identity and evidence digests",
+    )
+    parser.add_argument(
+        "--provenance",
+        help="Write a custom in-toto predicate for clean rebuild evidence",
     )
     parser.add_argument(
         "--fail-on-failure",
@@ -153,6 +192,18 @@ def assurance(conan_api, parser, *args):
         raise ConanException("--source-timeout must be positive")
     if parsed.source_max_bytes <= 0:
         raise ConanException("--source-max-bytes must be positive")
+    if parsed.rebuild_timeout <= 0:
+        raise ConanException("--rebuild-timeout must be positive")
+    if parsed.rebuild_package and parsed.rebuild_count < 2:
+        raise ConanException(
+            "--rebuild-count must be at least 2 when reproducibility is checked"
+        )
+    if parsed.provenance and not parsed.rebuild_package:
+        raise ConanException("--provenance requires at least one --rebuild-package")
+    if parsed.rebuild_package:
+        parsed.materialize_packages = True
+        parsed.verify_package_bytes = True
+        parsed.verify_source_bytes = True
     if parsed.verify_package_bytes and not parsed.materialize_packages:
         raise ConanException(
             "--verify-package-bytes requires --materialize-packages "
@@ -183,12 +234,28 @@ def assurance(conan_api, parser, *args):
         source_max_bytes=parsed.source_max_bytes,
         verify_package_bytes=parsed.verify_package_bytes,
     )
+    rebuild_records = []
+    if parsed.rebuild_package:
+        rebuild_evidence, rebuild_records = verify_reproducible_builds(
+            serialized,
+            conan_api,
+            targets=parsed.rebuild_package,
+            count=parsed.rebuild_count,
+            timeout=parsed.rebuild_timeout,
+            remote=parsed.remote,
+            graph_args=parsed.graph_arg,
+        )
+        evidence.extend(rebuild_evidence)
+        evidence.sort(key=lambda item: (item.reference, item.check))
+
     result = summarize(evidence)
 
     if parsed.report:
         write_ndjson(parsed.report, evidence)
     if parsed.receipt:
         write_receipt(parsed.receipt, serialized, evidence)
+    if parsed.provenance:
+        write_provenance(parsed.provenance, serialized, evidence, rebuild_records)
 
     _print_text(result)
     _enforce_policy(
@@ -574,12 +641,29 @@ def _package_bytes_evidence(reference: str, node: dict, conan_api) -> Evidence:
 
 
 def _package_tree_digest(root: Path) -> tuple[str, int, int]:
+    return _digest_tree(root, excluded=frozenset())
+
+
+def _package_payload_digest(root: Path) -> tuple[str, int, int]:
+    return _digest_tree(
+        root,
+        excluded=frozenset({"conaninfo.txt", "conanmanifest.txt"}),
+    )
+
+
+def _digest_tree(
+    root: Path,
+    *,
+    excluded: frozenset[str],
+) -> tuple[str, int, int]:
     digest = hashlib.sha256()
     files = 0
     total = 0
 
     for path in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).as_posix()):
         relative = path.relative_to(root).as_posix()
+        if relative in excluded:
+            continue
         if path.is_symlink():
             target = os.readlink(path)
             digest.update(b"L\0")
@@ -612,6 +696,236 @@ def _package_tree_digest(root: Path) -> tuple[str, int, int]:
                 digest.update(chunk)
 
     return digest.hexdigest(), files, total
+
+def verify_reproducible_builds(
+    serialized_graph: dict,
+    conan_api,
+    *,
+    targets: list[str],
+    count: int,
+    timeout: int,
+    remote: str,
+    graph_args: list[str],
+) -> tuple[list[Evidence], list[RebuildRecord]]:
+    nodes = {
+        _reference(node): node
+        for node in serialized_graph.get("nodes", {}).values()
+        if _reference(node) is not None
+    }
+    evidence: list[Evidence] = []
+    records: list[RebuildRecord] = []
+
+    for target in targets:
+        node = nodes.get(target)
+        if node is None:
+            evidence.append(Evidence(
+                target, "rebuild-repeatability", "UNKNOWN",
+                "requested rebuild target is not present in the resolved graph",
+            ))
+            continue
+        try:
+            target_path, fullref = _resolved_package_path(conan_api, node)
+            consumed_sha, _, _ = _package_payload_digest(target_path)
+        except Exception:
+            evidence.append(Evidence(
+                target, "rebuild-repeatability", "UNKNOWN",
+                "consumed package payload could not be read from the Conan cache",
+            ))
+            continue
+
+        attempts: list[dict] = []
+        for attempt in range(1, count + 1):
+            try:
+                attempts.append(_clean_rebuild(
+                    target, node, conan_api,
+                    remote=remote,
+                    graph_args=graph_args,
+                    timeout=timeout,
+                    attempt=attempt,
+                ))
+            except Exception as exc:
+                evidence.append(Evidence(
+                    target, "rebuild-repeatability", "UNKNOWN",
+                    f"clean rebuild {attempt} failed: {type(exc).__name__}",
+                    (f"conan:{fullref}",),
+                ))
+                attempts = []
+                break
+        if not attempts:
+            continue
+        rebuild_digests = tuple(item["payload_sha256"] for item in attempts)
+        rebuild_prevs = tuple(item["package_revision"] for item in attempts)
+        log_digests = tuple(item["log_sha256"] for item in attempts)
+        repeatable = len(set(rebuild_digests)) == 1
+        matches_consumed = repeatable and rebuild_digests[0] == consumed_sha
+        locations = (
+            f"conan:{fullref}",
+            f"sha256:{consumed_sha}",
+            *tuple(
+                f"rebuild:{i + 1}:sha256:{digest}"
+                for i, digest in enumerate(rebuild_digests)
+            ),
+        )
+
+        evidence.append(Evidence(
+            target,
+            "rebuild-repeatability",
+            "PASS" if repeatable else "FAIL",
+            (
+                f"{count} clean-cache rebuilds produced the same package payload"
+                if repeatable else
+                f"{count} clean-cache rebuilds produced different package payloads"
+            ),
+            locations,
+        ))
+        evidence.append(Evidence(
+            target,
+            "consumed-binary-reproduction",
+            "PASS" if matches_consumed else "FAIL",
+            (
+                "clean rebuild payload matches the package bytes Conan consumed"
+                if matches_consumed else
+                "clean rebuilds are repeatable but do not match the package bytes Conan consumed"
+                if repeatable else
+                "clean rebuilds are not repeatable, so consumed binary reproduction is unproven"
+            ),
+            locations,
+        ))
+
+        records.append(RebuildRecord(
+            reference=target,
+            recipe_revision=str(node.get("rrev")),
+            consumed_package_id=str(node.get("package_id")),
+            consumed_package_revision=str(node.get("prev")),
+            consumed_payload_sha256=consumed_sha,
+            rebuild_payload_sha256=rebuild_digests,
+            rebuild_package_revisions=rebuild_prevs,
+            rebuild_log_sha256=log_digests,
+            repeatable=repeatable,
+            matches_consumed=matches_consumed,
+            builder=_builder_identity(),
+        ))
+
+    return evidence, records
+def _resolved_package_path(conan_api, node: dict) -> tuple[Path, str]:
+    ref = str(node["ref"]).split("#", 1)[0]
+    fullref = (
+        f"{ref}#{node['rrev']}:{node['package_id']}#{node['prev']}"
+    )
+    return Path(
+        conan_api.cache.package_path(PkgReference.loads(fullref))
+    ), fullref
+
+
+def _clean_rebuild(
+    reference: str,
+    node: dict,
+    conan_api,
+    *,
+    remote: str,
+    graph_args: list[str],
+    timeout: int,
+    attempt: int,
+) -> dict:
+    conan = shutil.which("conan")
+    if conan is None:
+        raise RuntimeError("conan executable not found")
+
+    recipe_ref = str(node["ref"]).split("#", 1)[0]
+    exact_ref = f"{recipe_ref}#{node['rrev']}"
+    build_pattern = f"{node['name']}/*"
+    with tempfile.TemporaryDirectory(
+        prefix=f"conan-assurance-rebuild-{attempt}-"
+    ) as directory:
+        root = Path(directory)
+        home = root / "home"
+        output = root / "out"
+        _copy_conan_rebuild_config(Path(conan_api.home_folder), home)
+        env = os.environ.copy()
+        env["CONAN_HOME"] = str(home)
+
+        command = [
+            conan, "install", f"--requires={exact_ref}",
+            f"-r={remote}", f"--build={build_pattern}",
+            f"--output-folder={output}", *graph_args,
+        ]
+        completed = subprocess.run(
+            command, env=env, capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+        log = completed.stdout + completed.stderr
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"conan rebuild exited {completed.returncode}: {log[-1000:]}"
+            )
+
+        graph_cmd = [
+            conan, "graph", "info", f"--requires={exact_ref}",
+            f"-r={remote}", *graph_args, "--format=json",
+        ]
+        graph = subprocess.run(
+            graph_cmd, env=env, capture_output=True, text=True,
+            timeout=timeout, check=True,
+        )
+        rebuilt = _find_rebuilt_node(json.loads(graph.stdout), reference)
+        rebuilt_ref = str(rebuilt["ref"]).split("#", 1)[0]
+        fullref = (
+            f"{rebuilt_ref}#{rebuilt['rrev']}:"
+            f"{rebuilt['package_id']}#{rebuilt['prev']}"
+        )
+        cache_path = subprocess.run(
+            [conan, "cache", "path", fullref],
+            env=env, capture_output=True, text=True,
+            timeout=60, check=True,
+        ).stdout.strip().splitlines()[-1]
+        payload_sha, files, size = _package_payload_digest(Path(cache_path))
+
+        return {
+            "payload_sha256": payload_sha,
+            "files": files,
+            "bytes": size,
+            "package_id": str(rebuilt["package_id"]),
+            "package_revision": str(rebuilt["prev"]),
+            "log_sha256": hashlib.sha256(log.encode("utf-8")).hexdigest(),
+        }
+
+
+def _find_rebuilt_node(graph: dict, reference: str) -> dict:
+    for node in graph.get("graph", {}).get("nodes", {}).values():
+        if _reference(node) == reference:
+            return node
+    raise RuntimeError(f"rebuilt node {reference} not found")
+def _copy_conan_rebuild_config(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    profiles = source / "profiles"
+    if profiles.is_dir():
+        shutil.copytree(profiles, destination / "profiles", dirs_exist_ok=True)
+
+    for name in ("global.conf", "settings.yml", "settings_user.yml"):
+        path = source / name
+        if path.is_file():
+            shutil.copy2(path, destination / name)
+
+
+def _builder_identity() -> dict:
+    identity = {
+        "platform": os.uname().sysname + "-" + os.uname().machine,
+    }
+    for name, command in (
+        ("conan", ["conan", "--version"]),
+        ("compiler", ["cc", "--version"]),
+        ("cmake", ["cmake", "--version"]),
+    ):
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True,
+                timeout=10, check=False,
+            )
+            first = (result.stdout or result.stderr).splitlines()
+            identity[name] = first[0] if first else "unknown"
+        except (OSError, subprocess.SubprocessError):
+            identity[name] = "unavailable"
+    return identity
 
 
 def source_entries(node: dict) -> list[dict]:
@@ -850,6 +1164,35 @@ def write_receipt(
     )
 
 
+def write_provenance(
+    path: str,
+    serialized_graph: dict,
+    evidence: list[Evidence],
+    rebuild_records: list[RebuildRecord],
+) -> None:
+    predicate = {
+        "schema": "https://windanvil.com/predicates/conan-rebuild/v1",
+        "graph_sha256": canonical_sha256(graph_identity(serialized_graph)),
+        "evidence_sha256": evidence_digest(evidence),
+        "rebuilds": [
+            {
+                **asdict(record),
+                "rebuild_payload_sha256": list(record.rebuild_payload_sha256),
+                "rebuild_package_revisions": list(record.rebuild_package_revisions),
+                "rebuild_log_sha256": list(record.rebuild_log_sha256),
+            }
+            for record in rebuild_records
+        ],
+    }
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(predicate, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def graph_identity(serialized_graph: dict) -> list[dict]:
     packages: list[dict] = []
     for _, node in sorted(
@@ -900,6 +1243,9 @@ def _receipt_packages(
         bound["package_tree_sha256"] = _evidence_sha256(
             checks.get("package-bytes")
         )
+        bound["package_payload_sha256"] = _location_sha256(
+            checks.get("consumed-binary-reproduction")
+        )
         bound["checks"] = {
             name: {
                 "status": item.status,
@@ -913,6 +1259,12 @@ def _receipt_packages(
 
 def _evidence_sha256(item: Evidence | None) -> str | None:
     if item is None or item.status != "PASS":
+        return None
+    return _location_sha256(item)
+
+
+def _location_sha256(item: Evidence | None) -> str | None:
+    if item is None:
         return None
     for location in item.locations:
         if location.startswith("sha256:"):

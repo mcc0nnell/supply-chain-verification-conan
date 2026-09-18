@@ -27,11 +27,45 @@ jobs:
           test -s demo/assurance.json
           test -s demo/assurance.ndjson
           test -s demo/receipt.json
+          test -s demo/provenance.json
           grep -q '"reference":"zlib/1.3.1"' demo/assurance.ndjson
-          grep -q '"check":"source-digest"' demo/assurance.ndjson
           grep -q '"check":"source-artifact-bytes"' demo/assurance.ndjson
           grep -q '"check":"package-bytes"' demo/assurance.ndjson
+          grep -q '"check":"rebuild-repeatability"' demo/assurance.ndjson
+          grep -q '"check":"consumed-binary-reproduction"' demo/assurance.ndjson
           grep -q '"check":"openssf-scorecard"' demo/assurance.ndjson
-          grep -q '"status":"PASS"' demo/assurance.ndjson
-          grep -q '"source_artifact_sha256"' demo/receipt.json
-          grep -q '"package_tree_sha256"' demo/receipt.json
+          grep -q '"package_payload_sha256"' demo/receipt.json
+          grep -q '"repeatable": true' demo/provenance.json
+
+  attest:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: chmod +x scripts/demo.sh && ./scripts/demo.sh
+      - id: subject
+        shell: bash
+        run: |
+          DIGEST=$(python - <<'PY'
+          import json
+          data = json.load(open("demo/provenance.json", encoding="utf-8"))
+          print(data["rebuilds"][0]["consumed_payload_sha256"])
+          PY
+          )
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest@v4
+        with:
+          subject-name: conan:zlib/1.3.1
+          subject-digest: sha256:${{ steps.subject.outputs.digest }}
+          predicate-type: https://windanvil.com/predicates/conan-rebuild/v1
+          predicate-path: demo/provenance.json

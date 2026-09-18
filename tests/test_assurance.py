@@ -146,6 +146,27 @@ class AssuranceTests(unittest.TestCase):
         self.assertEqual(digest1[2], 13)
         self.assertEqual(len(digest1[0]), 64)
 
+    def test_payload_digest_ignores_conan_generated_metadata(self):
+        with tempfile.TemporaryDirectory() as a_dir, tempfile.TemporaryDirectory() as b_dir:
+            a = pathlib.Path(a_dir)
+            b = pathlib.Path(b_dir)
+            for root in (a, b):
+                (root / "lib").mkdir()
+                (root / "lib" / "libdemo.a").write_bytes(b"same-payload")
+            (a / "conanmanifest.txt").write_text("timestamp-a", encoding="utf-8")
+            (b / "conanmanifest.txt").write_text("timestamp-b", encoding="utf-8")
+            (a / "conaninfo.txt").write_text("info-a", encoding="utf-8")
+            (b / "conaninfo.txt").write_text("info-b", encoding="utf-8")
+
+            self.assertEqual(
+                assurance._package_payload_digest(a),
+                assurance._package_payload_digest(b),
+            )
+            self.assertNotEqual(
+                assurance._package_tree_digest(a),
+                assurance._package_tree_digest(b),
+            )
+
     def test_receipt_binds_graph_source_and_package_digests(self):
         source_sha = "1" * 64
         package_sha = "2" * 64
