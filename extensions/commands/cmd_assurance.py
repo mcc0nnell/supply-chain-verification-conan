@@ -7,10 +7,12 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -53,6 +55,63 @@ class RebuildRecord:
     repeatable: bool
     matches_consumed: bool
     builder: dict
+
+
+@dataclass(frozen=True)
+class CelixBundleRecord:
+    path: str
+    symbolic_name: str
+    version: str
+    manifest_version: str
+    activator: str | None
+    private_libraries: tuple[str, ...]
+    archive_sha256: str
+    bundle_content_sha256: str
+    manifest_sha256: str
+    members: tuple[tuple[str, str], ...]
+
+    @property
+    def reference(self) -> str:
+        return f"celix-bundle:{self.symbolic_name}@{self.version}"
+
+    def json(self) -> dict:
+        return {
+            "path": self.path,
+            "reference": self.reference,
+            "symbolic_name": self.symbolic_name,
+            "version": self.version,
+            "manifest_version": self.manifest_version,
+            "activator": self.activator,
+            "private_libraries": list(self.private_libraries),
+            "archive_sha256": self.archive_sha256,
+            "bundle_content_sha256": self.bundle_content_sha256,
+            "manifest_sha256": self.manifest_sha256,
+            "members": [
+                {"path": path, "sha256": digest}
+                for path, digest in self.members
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class CelixContainerRecord:
+    path: str
+    config_sha256: str
+    composition_sha256: str
+    bundles: tuple[dict, ...]
+
+    @property
+    def reference(self) -> str:
+        return f"celix-container:{self.path}"
+
+    def json(self) -> dict:
+        return {
+            "path": self.path,
+            "reference": self.reference,
+            "config_sha256": self.config_sha256,
+            "composition_sha256": self.composition_sha256,
+            "bundles": list(self.bundles),
+        }
 
 
 def _format_json(result):
@@ -163,6 +222,24 @@ def assurance(conan_api, parser, *args):
         help="Timeout for each clean rebuild in seconds (default: 900)",
     )
     parser.add_argument(
+        "--celix-bundle",
+        action="append",
+        default=[],
+        help="Inspect a Celix bundle ZIP as a first-class assurance subject (repeatable)",
+    )
+    parser.add_argument(
+        "--celix-bundle-dir",
+        action="append",
+        default=[],
+        help="Discover Celix bundle ZIPs recursively under this directory (repeatable)",
+    )
+    parser.add_argument(
+        "--celix-container-config",
+        action="append",
+        default=[],
+        help="Bind a Celix JSON or .properties container config to verified bundle identities (repeatable)",
+    )
+    parser.add_argument(
         "--report",
         help="Write deterministic NDJSON evidence to this path before policy enforcement",
     )
@@ -173,6 +250,10 @@ def assurance(conan_api, parser, *args):
     parser.add_argument(
         "--provenance",
         help="Write a custom in-toto predicate for clean rebuild evidence",
+    )
+    parser.add_argument(
+        "--celix-provenance",
+        help="Write a custom predicate for Celix bundle identities and container composition",
     )
     parser.add_argument(
         "--fail-on-failure",
@@ -200,6 +281,12 @@ def assurance(conan_api, parser, *args):
         )
     if parsed.provenance and not parsed.rebuild_package:
         raise ConanException("--provenance requires at least one --rebuild-package")
+    if parsed.celix_provenance and not (
+        parsed.celix_bundle or parsed.celix_bundle_dir
+    ):
+        raise ConanException(
+            "--celix-provenance requires --celix-bundle or --celix-bundle-dir"
+        )
     if parsed.rebuild_package:
         parsed.materialize_packages = True
         parsed.verify_package_bytes = True
@@ -246,16 +333,45 @@ def assurance(conan_api, parser, *args):
             graph_args=parsed.graph_arg,
         )
         evidence.extend(rebuild_evidence)
-        evidence.sort(key=lambda item: (item.reference, item.check))
 
+    celix_bundles: list[CelixBundleRecord] = []
+    celix_containers: list[CelixContainerRecord] = []
+    if parsed.celix_bundle or parsed.celix_bundle_dir:
+        celix_evidence, celix_bundles = inspect_celix_bundles(
+            parsed.celix_bundle,
+            parsed.celix_bundle_dir,
+        )
+        evidence.extend(celix_evidence)
+
+    if parsed.celix_container_config:
+        container_evidence, celix_containers = inspect_celix_containers(
+            parsed.celix_container_config,
+            celix_bundles,
+        )
+        evidence.extend(container_evidence)
+
+    evidence.sort(key=lambda item: (item.reference, item.check))
     result = summarize(evidence)
 
     if parsed.report:
         write_ndjson(parsed.report, evidence)
     if parsed.receipt:
-        write_receipt(parsed.receipt, serialized, evidence)
+        write_receipt(
+            parsed.receipt,
+            serialized,
+            evidence,
+            celix_bundles=celix_bundles,
+            celix_containers=celix_containers,
+        )
     if parsed.provenance:
         write_provenance(parsed.provenance, serialized, evidence, rebuild_records)
+    if parsed.celix_provenance:
+        write_celix_provenance(
+            parsed.celix_provenance,
+            celix_bundles,
+            celix_containers,
+            evidence,
+        )
 
     _print_text(result)
     _enforce_policy(
@@ -1129,14 +1245,639 @@ def _format_score(score: float) -> str:
     return str(int(score)) if score.is_integer() else str(score)
 
 
+def inspect_celix_bundles(
+    explicit_paths: list[str],
+    directories: list[str],
+) -> tuple[list[Evidence], list[CelixBundleRecord]]:
+    evidence: list[Evidence] = []
+    records: list[CelixBundleRecord] = []
+    candidates: dict[Path, bool] = {}
+
+    for value in explicit_paths:
+        candidates[Path(value).expanduser().resolve()] = True
+
+    for value in directories:
+        directory = Path(value).expanduser().resolve()
+        if not directory.is_dir():
+            evidence.append(Evidence(
+                f"celix-bundle-dir:{_display_path(directory)}",
+                "celix-bundle-discovery",
+                "FAIL",
+                "Celix bundle discovery directory does not exist",
+                (_display_path(directory),),
+            ))
+            continue
+        for path in sorted(directory.rglob("*.zip")):
+            candidates.setdefault(path.resolve(), False)
+
+    seen_refs: dict[str, str] = {}
+    for path, explicit in sorted(
+        candidates.items(),
+        key=lambda item: item[0].as_posix(),
+    ):
+        if not path.is_file():
+            evidence.append(Evidence(
+                f"celix-bundle-file:{_display_path(path)}",
+                "celix-bundle-identity",
+                "FAIL",
+                "Celix bundle path does not exist",
+                (_display_path(path),),
+            ))
+            continue
+
+        try:
+            record, checks = _inspect_celix_bundle(path)
+        except _NotCelixBundle:
+            if explicit:
+                evidence.append(Evidence(
+                    f"celix-bundle-file:{_display_path(path)}",
+                    "celix-bundle-identity",
+                    "FAIL",
+                    "ZIP does not contain META-INF/MANIFEST.json",
+                    (_display_path(path),),
+                ))
+            continue
+        except (OSError, zipfile.BadZipFile, json.JSONDecodeError, ValueError) as exc:
+            evidence.append(Evidence(
+                f"celix-bundle-file:{_display_path(path)}",
+                "celix-bundle-identity",
+                "FAIL",
+                f"Celix bundle could not be inspected: {type(exc).__name__}",
+                (_display_path(path),),
+            ))
+            continue
+
+        previous = seen_refs.get(record.reference)
+        if previous is not None:
+            evidence.append(Evidence(
+                record.reference,
+                "celix-bundle-identity",
+                "FAIL",
+                "duplicate Celix symbolic-name/version identity",
+                (previous, record.path),
+            ))
+            continue
+
+        seen_refs[record.reference] = record.path
+        records.append(record)
+        evidence.extend(checks)
+
+    records.sort(key=lambda item: (item.symbolic_name, item.version, item.path))
+    if records:
+        bundle_set = _celix_bundle_set_identity(records)
+        bundle_set_sha = canonical_sha256(bundle_set)
+        evidence.append(Evidence(
+            "celix-bundle-set",
+            "celix-bundle-set",
+            "PASS",
+            (
+                f"bundle set binds {len(records)} Celix bundle(s); "
+                f"sha256 {bundle_set_sha}"
+            ),
+            (f"sha256:{bundle_set_sha}",),
+        ))
+
+    evidence.sort(key=lambda item: (item.reference, item.check))
+    return evidence, records
+
+
+class _NotCelixBundle(Exception):
+    pass
+
+
+def _inspect_celix_bundle(
+    path: Path,
+) -> tuple[CelixBundleRecord, list[Evidence]]:
+    archive_sha = _sha256_file(path)
+
+    with zipfile.ZipFile(path) as archive:
+        infos = [info for info in archive.infolist() if not info.is_dir()]
+        names = [info.filename.replace("\\", "/") for info in infos]
+        if "META-INF/MANIFEST.json" not in names:
+            raise _NotCelixBundle()
+
+        layout_errors = _celix_archive_layout_errors(archive, infos)
+        manifest_raw = archive.read("META-INF/MANIFEST.json")
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("Celix manifest must be a JSON object")
+
+        symbolic = _manifest_string(manifest, "CELIX_BUNDLE_SYMBOLIC_NAME")
+        version = _normalize_celix_version(
+            _manifest_string(manifest, "CELIX_BUNDLE_VERSION")
+        )
+        manifest_version = _normalize_celix_version(
+            _manifest_string(manifest, "CELIX_BUNDLE_MANIFEST_VERSION")
+        )
+        activator = _manifest_optional_string(
+            manifest,
+            "CELIX_BUNDLE_ACTIVATOR_LIBRARY",
+        )
+        private_libraries = tuple(sorted(_manifest_string_list(
+            manifest,
+            "CELIX_BUNDLE_PRIVATE_LIBRARIES",
+        )))
+
+        if not symbolic or not version or not manifest_version:
+            raise ValueError("Celix manifest is missing required bundle identity fields")
+
+        normalized_names = set(names)
+        missing: list[str] = []
+        if activator and activator.replace("\\", "/") not in normalized_names:
+            missing.append(activator)
+        for library in private_libraries:
+            if library.replace("\\", "/") not in normalized_names:
+                missing.append(library)
+
+        members: list[tuple[str, str]] = []
+        for info in sorted(infos, key=lambda item: item.filename.replace("\\", "/")):
+            normalized = info.filename.replace("\\", "/")
+            data = archive.read(info)
+            members.append((normalized, hashlib.sha256(data).hexdigest()))
+
+        bundle_content_sha = _celix_bundle_content_sha256(archive, infos)
+
+    manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+    record = CelixBundleRecord(
+        path=_display_path(path),
+        symbolic_name=symbolic,
+        version=version,
+        manifest_version=manifest_version,
+        activator=activator,
+        private_libraries=private_libraries,
+        archive_sha256=archive_sha,
+        bundle_content_sha256=bundle_content_sha,
+        manifest_sha256=manifest_sha,
+        members=tuple(members),
+    )
+
+    checks: list[Evidence] = []
+    checks.append(Evidence(
+        record.reference,
+        "celix-archive-layout",
+        "FAIL" if layout_errors else "PASS",
+        (
+            "; ".join(layout_errors)
+            if layout_errors
+            else f"bundle archive has {len(members)} safe file member(s)"
+        ),
+        (record.path, f"archive-sha256:{record.archive_sha256}"),
+    ))
+    checks.append(Evidence(
+        record.reference,
+        "celix-manifest",
+        "PASS",
+        (
+            f"manifest identity {symbolic}@{version}; "
+            f"manifest-version={manifest_version}"
+        ),
+        (
+            record.path,
+            f"manifest-sha256:{record.manifest_sha256}",
+        ),
+    ))
+    checks.append(Evidence(
+        record.reference,
+        "celix-library-closure",
+        "FAIL" if missing else "PASS",
+        (
+            "manifest declares missing bundle library member(s): "
+            + ", ".join(sorted(missing))
+            if missing
+            else (
+                "manifest activator/private-library references are present"
+                if activator or private_libraries
+                else "resource-only bundle has no manifest library references"
+            )
+        ),
+        (
+            record.path,
+            *tuple(f"missing-member:{name}" for name in sorted(set(missing))),
+        ),
+    ))
+    checks.append(Evidence(
+        record.reference,
+        "celix-bundle-content",
+        "FAIL" if layout_errors else "PASS",
+        (
+            "FCR-compatible bundle content digest "
+            f"{record.bundle_content_sha256}; archive sha256 {record.archive_sha256}"
+        ),
+        (
+            record.path,
+            f"sha256:{record.bundle_content_sha256}",
+            f"archive-sha256:{record.archive_sha256}",
+        ),
+    ))
+    return record, checks
+
+
+def _celix_bundle_content_sha256(
+    archive: zipfile.ZipFile,
+    infos: list[zipfile.ZipInfo],
+) -> str:
+    """Match fineract-celix fcr.bundle-content.v1 over extracted bundle files."""
+    digest = hashlib.sha256()
+    _sha256_add_length_prefixed(digest, b"fcr.bundle-content.v1")
+
+    for info in sorted(infos, key=lambda item: item.filename.replace("\\", "/")):
+        normalized = info.filename.replace("\\", "/")
+        if _zip_info_is_symlink(info):
+            continue
+        data = archive.read(info)
+        _sha256_add_length_prefixed(digest, normalized.encode("utf-8"))
+        _sha256_add_length_prefixed(digest, data)
+
+    return digest.hexdigest()
+
+
+def _sha256_add_length_prefixed(digest, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, byteorder="big", signed=False))
+    digest.update(value)
+
+
+def _zip_info_is_symlink(info: zipfile.ZipInfo) -> bool:
+    mode = (info.external_attr >> 16) & 0xFFFF
+    return stat.S_ISLNK(mode)
+
+
+def _celix_archive_layout_errors(
+    archive: zipfile.ZipFile,
+    infos: list[zipfile.ZipInfo],
+) -> list[str]:
+    errors: list[str] = []
+    seen: set[str] = set()
+
+    for info in infos:
+        name = info.filename
+        normalized = name.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        if (
+            normalized.startswith("/")
+            or re.match(r"^[A-Za-z]:/", normalized)
+            or ".." in parts
+        ):
+            errors.append(f"unsafe bundle member path: {name}")
+
+        if normalized in seen:
+            errors.append(f"duplicate bundle member path: {name}")
+        seen.add(normalized)
+
+        if _zip_info_is_symlink(info):
+            try:
+                target = archive.read(info).decode("utf-8")
+            except UnicodeDecodeError:
+                errors.append(f"bundle symlink target is not UTF-8: {name}")
+                continue
+            if _celix_symlink_escapes(normalized, target):
+                errors.append(f"bundle symlink escapes bundle root: {name} -> {target}")
+
+    return errors
+
+
+def _celix_symlink_escapes(name: str, target: str) -> bool:
+    target = target.replace("\\", "/")
+    if target.startswith("/") or re.match(r"^[A-Za-z]:/", target):
+        return True
+
+    base = [part for part in name.split("/")[:-1] if part]
+    for part in target.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not base:
+                return True
+            base.pop()
+        else:
+            base.append(part)
+    return False
+
+def _manifest_string(manifest: dict, key: str) -> str:
+    value = manifest.get(key)
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _manifest_optional_string(manifest: dict, key: str) -> str | None:
+    value = _manifest_string(manifest, key)
+    return value or None
+
+
+def _manifest_string_list(manifest: dict, key: str) -> list[str]:
+    value = manifest.get(key)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        ]
+    raise ValueError(f"{key} must be a string or list of strings")
+
+
+def _normalize_celix_version(value: str) -> str:
+    value = value.strip()
+    match = re.fullmatch(r"version<(.+)>", value)
+    return match.group(1).strip() if match else value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
+def inspect_celix_containers(
+    config_paths: list[str],
+    bundles: list[CelixBundleRecord],
+) -> tuple[list[Evidence], list[CelixContainerRecord]]:
+    evidence: list[Evidence] = []
+    records: list[CelixContainerRecord] = []
+
+    by_basename: dict[str, list[CelixBundleRecord]] = {}
+    by_reference = {bundle.reference: bundle for bundle in bundles}
+    for bundle in bundles:
+        by_basename.setdefault(Path(bundle.path).name, []).append(bundle)
+
+    for value in config_paths:
+        path = Path(value).expanduser().resolve()
+        reference = f"celix-container:{_display_path(path)}"
+
+        if not path.is_file():
+            evidence.append(Evidence(
+                reference,
+                "celix-container-composition",
+                "FAIL",
+                "Celix container config does not exist",
+                (_display_path(path),),
+            ))
+            continue
+
+        try:
+            config = _read_celix_container_config(path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            evidence.append(Evidence(
+                reference,
+                "celix-container-composition",
+                "FAIL",
+                f"Celix container config could not be parsed: {type(exc).__name__}",
+                (_display_path(path),),
+            ))
+            continue
+
+        if not isinstance(config, dict):
+            evidence.append(Evidence(
+                reference,
+                "celix-container-composition",
+                "FAIL",
+                "Celix container config must resolve to a key/value object",
+                (_display_path(path),),
+            ))
+            continue
+
+        declared = _celix_configured_bundle_locations(config)
+        entries: list[dict] = []
+        unresolved: list[str] = []
+        ambiguous: list[str] = []
+
+        for mode, level, order, location in declared:
+            bundle = _resolve_celix_bundle_location(
+                location,
+                path.parent,
+                bundles,
+                by_basename,
+                by_reference,
+            )
+            if bundle == "AMBIGUOUS":
+                ambiguous.append(location)
+                entries.append({
+                    "mode": mode,
+                    "level": level,
+                    "order": order,
+                    "location": location,
+                    "bundle": None,
+                })
+                continue
+            if bundle is None:
+                unresolved.append(location)
+                entries.append({
+                    "mode": mode,
+                    "level": level,
+                    "order": order,
+                    "location": location,
+                    "bundle": None,
+                })
+                continue
+
+            entries.append({
+                "mode": mode,
+                "level": level,
+                "order": order,
+                "location": location,
+                "bundle": bundle.reference,
+                "bundle_content_sha256": bundle.bundle_content_sha256,
+            })
+
+        config_sha = _sha256_file(path)
+        composition_sha = canonical_sha256(entries)
+        status = "FAIL" if unresolved or ambiguous else "PASS"
+        if unresolved:
+            summary = (
+                f"container composition has {len(unresolved)} unresolved bundle(s)"
+            )
+        elif ambiguous:
+            summary = (
+                f"container composition has {len(ambiguous)} ambiguous bundle(s)"
+            )
+        else:
+            summary = (
+                f"container composition binds {len(entries)} bundle placement(s); "
+                f"sha256 {composition_sha}"
+            )
+
+        locations = [
+            _display_path(path),
+            f"config-sha256:{config_sha}",
+            f"sha256:{composition_sha}",
+        ]
+        locations.extend(
+            f"bundle:{entry['bundle']}:{entry['bundle_content_sha256']}"
+            for entry in entries
+            if entry.get("bundle") and entry.get("bundle_content_sha256")
+        )
+        locations.extend(f"unresolved:{item}" for item in unresolved)
+        locations.extend(f"ambiguous:{item}" for item in ambiguous)
+
+        record = CelixContainerRecord(
+            path=_display_path(path),
+            config_sha256=config_sha,
+            composition_sha256=composition_sha,
+            bundles=tuple(entries),
+        )
+        records.append(record)
+        evidence.append(Evidence(
+            record.reference,
+            "celix-container-composition",
+            status,
+            summary,
+            tuple(locations),
+        ))
+
+    records.sort(key=lambda item: item.path)
+    evidence.sort(key=lambda item: (item.reference, item.check))
+    return evidence, records
+
+
+def _read_celix_container_config(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8")
+
+    if path.suffix.lower() == ".json" or text.lstrip().startswith("{"):
+        value = json.loads(text)
+        if not isinstance(value, dict):
+            raise ValueError("Celix JSON config must be an object")
+        return value
+
+    config: dict[str, str] = {}
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if pending:
+            line = pending + line.lstrip()
+            pending = ""
+        if line.endswith("\\"):
+            pending = line[:-1]
+            continue
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("!"):
+            continue
+
+        split_at = None
+        for separator in ("=", ":"):
+            index = stripped.find(separator)
+            if index >= 0 and (split_at is None or index < split_at):
+                split_at = index
+        if split_at is None:
+            parts = stripped.split(None, 1)
+            key = parts[0]
+            value = parts[1] if len(parts) == 2 else ""
+        else:
+            key = stripped[:split_at].strip()
+            value = stripped[split_at + 1:].strip()
+
+        if not key:
+            raise ValueError("Celix properties config contains an empty key")
+        config[key] = value
+
+    if pending:
+        raise ValueError("Celix properties config ends with an unfinished continuation")
+    return config
+
+
+def _celix_configured_bundle_locations(
+    config: dict,
+) -> list[tuple[str, int | None, int, str]]:
+    result: list[tuple[str, int | None, int, str]] = []
+
+    for level in range(7):
+        key = f"CELIX_AUTO_START_{level}"
+        for order, location in enumerate(_split_celix_locations(config.get(key))):
+            result.append(("auto-start", level, order, location))
+
+    for order, location in enumerate(
+        _split_celix_locations(config.get("CELIX_AUTO_INSTALL"))
+    ):
+        result.append(("auto-install", None, order, location))
+
+    return result
+
+
+def _split_celix_locations(value) -> list[str]:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    if "," in value:
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [part for part in value.split() if part]
+
+
+def _resolve_celix_bundle_location(
+    location: str,
+    config_dir: Path,
+    bundles: list[CelixBundleRecord],
+    by_basename: dict[str, list[CelixBundleRecord]],
+    by_reference: dict[str, CelixBundleRecord],
+):
+    if location in by_reference:
+        return by_reference[location]
+
+    location_path = Path(location)
+    basename = location_path.name
+    candidates = by_basename.get(basename, [])
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        return "AMBIGUOUS"
+
+    try:
+        configured = (config_dir / location_path).resolve()
+    except OSError:
+        configured = None
+
+    if configured is not None:
+        for bundle in bundles:
+            try:
+                if Path(bundle.path).resolve() == configured:
+                    return bundle
+            except OSError:
+                continue
+
+    return None
+
+
 def summarize(evidence: list[Evidence]) -> dict:
     counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "UNKNOWN": 0}
     for item in evidence:
         counts[item.status] = counts.get(item.status, 0) + 1
 
     refs = sorted({item.reference for item in evidence})
+    package_refs = [
+        reference
+        for reference in refs
+        if not reference.startswith("celix-bundle:")
+        and not reference.startswith("celix-bundle-set")
+        and not reference.startswith("celix-container:")
+        and not reference.startswith("celix-bundle-file:")
+        and not reference.startswith("celix-bundle-dir:")
+    ]
+    bundle_refs = [
+        reference for reference in refs
+        if reference.startswith("celix-bundle:")
+    ]
+    container_refs = [
+        reference for reference in refs
+        if reference.startswith("celix-container:")
+    ]
     return {
-        "packages": len(refs),
+        "packages": len(package_refs),
+        "celix_bundles": len(bundle_refs),
+        "celix_containers": len(container_refs),
+        "subjects": len(package_refs) + len(bundle_refs) + len(container_refs),
         "observations": len(evidence),
         "counts": counts,
         "evidence": [item.json() for item in evidence],
@@ -1153,17 +1894,111 @@ def write_ndjson(path: str, evidence: list[Evidence]) -> None:
     target.write_text(payload, encoding="utf-8")
 
 
+def _celix_bundle_subject(bundle: CelixBundleRecord) -> dict:
+    return {
+        "reference": bundle.reference,
+        "bundle_content_sha256": bundle.bundle_content_sha256,
+    }
+
+
+def _celix_container_subject(container: CelixContainerRecord) -> dict:
+    return {
+        "config_sha256": container.config_sha256,
+        "composition_sha256": container.composition_sha256,
+    }
+
+
+def _celix_subject_identity(
+    bundles: list[CelixBundleRecord],
+    containers: list[CelixContainerRecord],
+) -> dict:
+    return {
+        "bundles": [
+            _celix_bundle_subject(bundle)
+            for bundle in sorted(
+                bundles,
+                key=lambda item: (item.symbolic_name, item.version, item.path),
+            )
+        ],
+        "containers": [
+            _celix_container_subject(container)
+            for container in sorted(containers, key=lambda item: item.path)
+        ],
+    }
+
+
+def _celix_bundle_set_identity(
+    bundles: list[CelixBundleRecord],
+) -> list[dict]:
+    return [
+        {
+            "reference": bundle.reference,
+            "bundle_content_sha256": bundle.bundle_content_sha256,
+        }
+        for bundle in sorted(
+            bundles,
+            key=lambda item: (item.symbolic_name, item.version, item.path),
+        )
+    ]
+
+
+def _celix_bundle_identity(bundle: CelixBundleRecord) -> dict:
+    return {
+        "reference": bundle.reference,
+        "symbolic_name": bundle.symbolic_name,
+        "version": bundle.version,
+        "manifest_version": bundle.manifest_version,
+        "activator": bundle.activator,
+        "private_libraries": list(bundle.private_libraries),
+        "archive_sha256": bundle.archive_sha256,
+        "bundle_content_sha256": bundle.bundle_content_sha256,
+        "manifest_sha256": bundle.manifest_sha256,
+        "members": [
+            {"path": path, "sha256": digest}
+            for path, digest in bundle.members
+        ],
+    }
+
+
+def _celix_container_identity(container: CelixContainerRecord) -> dict:
+    return {
+        "config_sha256": container.config_sha256,
+        "composition_sha256": container.composition_sha256,
+        "bundles": list(container.bundles),
+    }
+
+
 def write_receipt(
     path: str,
     serialized_graph: dict,
     evidence: list[Evidence],
+    *,
+    celix_bundles: list[CelixBundleRecord] | None = None,
+    celix_containers: list[CelixContainerRecord] | None = None,
 ) -> None:
     identity = graph_identity(serialized_graph)
+    celix_bundles = celix_bundles or []
+    celix_containers = celix_containers or []
+    celix_identity = _celix_subject_identity(
+        celix_bundles,
+        celix_containers,
+    )
     receipt = {
-        "schema": "https://windanvil.com/schemas/conan-assurance-receipt/v1",
+        "schema": "https://windanvil.com/schemas/conan-assurance-receipt/v2",
         "graph_sha256": canonical_sha256(identity),
+        "celix_subject_sha256": (
+            canonical_sha256(celix_identity)
+            if celix_bundles or celix_containers
+            else None
+        ),
+        "subject_sha256": canonical_sha256({
+            "conan_graph": identity,
+            "celix": celix_identity,
+        }),
         "evidence_sha256": evidence_digest(evidence),
         "packages": _receipt_packages(identity, evidence),
+        "celix_bundles": [bundle.json() for bundle in celix_bundles],
+        "celix_containers": [container.json() for container in celix_containers],
     }
 
     target = Path(path)
@@ -1173,6 +2008,55 @@ def write_receipt(
         encoding="utf-8",
     )
 
+
+def write_celix_provenance(
+    path: str,
+    bundles: list[CelixBundleRecord],
+    containers: list[CelixContainerRecord],
+    evidence: list[Evidence],
+) -> None:
+    bundle_identity = [
+        _celix_bundle_identity(bundle)
+        for bundle in sorted(
+            bundles,
+            key=lambda item: (item.symbolic_name, item.version, item.path),
+        )
+    ]
+    container_identity = [
+        _celix_container_identity(container)
+        for container in sorted(containers, key=lambda item: item.path)
+    ]
+    subject_identity = _celix_subject_identity(bundles, containers)
+    celix_evidence = [
+        item
+        for item in evidence
+        if item.reference.startswith("celix-")
+    ]
+    predicate = {
+        "schema": "https://windanvil.com/predicates/celix-runtime/v1",
+        "subject_sha256": canonical_sha256(subject_identity),
+        "bundle_set_sha256": canonical_sha256([
+            _celix_bundle_subject(bundle)
+            for bundle in sorted(
+                bundles,
+                key=lambda item: (item.symbolic_name, item.version, item.path),
+            )
+        ]),
+        "container_set_sha256": canonical_sha256([
+            _celix_container_subject(container)
+            for container in sorted(containers, key=lambda item: item.path)
+        ]),
+        "evidence_sha256": evidence_digest(celix_evidence),
+        "bundles": bundle_identity,
+        "containers": container_identity,
+    }
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(predicate, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 def write_provenance(
     path: str,
@@ -1290,6 +2174,8 @@ def _print_text(result: dict) -> None:
     out.info(
         "assurance: "
         f"packages={result['packages']} "
+        f"celix_bundles={result.get('celix_bundles', 0)} "
+        f"celix_containers={result.get('celix_containers', 0)} "
         f"observations={result['observations']} "
         f"pass={counts['PASS']} "
         f"warn={counts['WARN']} "

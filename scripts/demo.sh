@@ -20,27 +20,137 @@ compiler.libcxx=libstdc++11
 compiler.cppstd=gnu17
 PROFILE
 
-mkdir -p "$ROOT/demo"
+rm -rf "$ROOT/demo"
+mkdir -p "$ROOT/demo/celix/bundles"
+
+cat > "$ROOT/demo/celix/demo_activator.c" <<'C'
+typedef struct celix_bundle_context celix_bundle_context_t;
+
+int celix_bundleActivator_create(
+    celix_bundle_context_t* ctx,
+    void** user_data
+) {
+    (void)ctx;
+    *user_data = 0;
+    return 0;
+}
+
+int celix_bundleActivator_start(
+    void* user_data,
+    celix_bundle_context_t* ctx
+) {
+    (void)user_data;
+    (void)ctx;
+    return 0;
+}
+
+int celix_bundleActivator_stop(
+    void* user_data,
+    celix_bundle_context_t* ctx
+) {
+    (void)user_data;
+    (void)ctx;
+    return 0;
+}
+
+int celix_bundleActivator_destroy(
+    void* user_data,
+    celix_bundle_context_t* ctx
+) {
+    (void)user_data;
+    (void)ctx;
+    return 0;
+}
+C
+
+cc -shared -fPIC \
+  -Wl,-soname,libdemo_activator.so \
+  -o "$ROOT/demo/celix/libdemo_activator.so" \
+  "$ROOT/demo/celix/demo_activator.c"
+
+python3 - "$ROOT/demo/celix" <<'PY'
+import json
+import pathlib
+import sys
+import zipfile
+
+root = pathlib.Path(sys.argv[1])
+bundles = root / "bundles"
+
+def write_bundle(path, manifest, files):
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "META-INF/MANIFEST.json",
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        )
+        for name, source in files:
+            archive.write(source, name)
+
+write_bundle(
+    bundles / "demo_service.zip",
+    {
+        "CELIX_BUNDLE_SYMBOLIC_NAME": "demo.service",
+        "CELIX_BUNDLE_VERSION": "version<1.0.0>",
+        "CELIX_BUNDLE_NAME": "Demo Service",
+        "CELIX_BUNDLE_ACTIVATOR_LIBRARY": "libdemo_activator.so",
+        "CELIX_BUNDLE_MANIFEST_VERSION": "version<2.0.0>",
+    },
+    [("libdemo_activator.so", root / "libdemo_activator.so")],
+)
+
+with zipfile.ZipFile(
+    bundles / "demo_config.zip",
+    "w",
+    compression=zipfile.ZIP_DEFLATED,
+) as archive:
+    archive.writestr(
+        "META-INF/MANIFEST.json",
+        json.dumps(
+            {
+                "CELIX_BUNDLE_SYMBOLIC_NAME": "demo.config",
+                "CELIX_BUNDLE_VERSION": "version<1.0.0>",
+                "CELIX_BUNDLE_NAME": "Demo Config",
+                "CELIX_BUNDLE_MANIFEST_VERSION": "version<2.0.0>",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    archive.writestr("config/demo.json", '{"enabled":true}\n')
+
+(root / "config.properties").write_text(
+    "CELIX_BUNDLES_PATH=bundles\n"
+    "CELIX_AUTO_START_1=demo_service.zip\n"
+    "CELIX_AUTO_START_3=demo_config.zip\n",
+    encoding="utf-8",
+)
+PY
+
 conan assurance \
   --requires=zlib/1.3.1 \
   -r=conancenter \
   --rebuild-package=zlib/1.3.1 \
   --rebuild-count=2 \
+  --celix-bundle-dir="$ROOT/demo/celix/bundles" \
+  --celix-container-config="$ROOT/demo/celix/config.properties" \
   --report="$ROOT/demo/assurance.ndjson" \
   --receipt="$ROOT/demo/receipt.json" \
   --provenance="$ROOT/demo/provenance.json" \
+  --celix-provenance="$ROOT/demo/celix-provenance.json" \
   --format=json > "$ROOT/demo/assurance.json"
 
-python3 - "$ROOT/demo/assurance.json" "$ROOT/demo/receipt.json" "$ROOT/demo/provenance.json" <<'PY'
+python3 - "$ROOT/demo/assurance.json" "$ROOT/demo/receipt.json" "$ROOT/demo/provenance.json" "$ROOT/demo/celix-provenance.json" <<'PY'
 import json
 import sys
 
 path = sys.argv[1]
 receipt_path = sys.argv[2]
 provenance_path = sys.argv[3]
+celix_provenance_path = sys.argv[4]
 data = json.load(open(path, encoding="utf-8"))
 receipt = json.load(open(receipt_path, encoding="utf-8"))
 provenance = json.load(open(provenance_path, encoding="utf-8"))
+celix_provenance = json.load(open(celix_provenance_path, encoding="utf-8"))
 items = data["evidence"]
 
 def find(check):
@@ -48,6 +158,12 @@ def find(check):
         if item["reference"] == "zlib/1.3.1" and item["check"] == check:
             return item
     raise SystemExit(f"missing zlib evidence for {check}")
+
+def find_subject(reference, check):
+    for item in items:
+        if item["reference"] == reference and item["check"] == check:
+            return item
+    raise SystemExit(f"missing evidence for {reference} / {check}")
 
 revision = find("recipe-revision")
 digest = find("source-digest")
@@ -79,6 +195,60 @@ assert package["package_payload_sha256"], package
 assert len(receipt["graph_sha256"]) == 64, receipt
 assert len(receipt["evidence_sha256"]) == 64, receipt
 
+service_ref = "celix-bundle:demo.service@1.0.0"
+config_ref = "celix-bundle:demo.config@1.0.0"
+for reference in (service_ref, config_ref):
+    for check in (
+        "celix-archive-layout",
+        "celix-manifest",
+        "celix-library-closure",
+        "celix-bundle-content",
+    ):
+        assert find_subject(reference, check)["status"] == "PASS", (reference, check)
+
+container = next(
+    item for item in items
+    if item["check"] == "celix-container-composition"
+)
+assert container["status"] == "PASS", container
+assert data["packages"] == 1, data
+assert data["celix_bundles"] == 2, data
+assert data["celix_containers"] == 1, data
+assert data["subjects"] == 4, data
+
+assert receipt["schema"].endswith("/v2"), receipt
+assert len(receipt["subject_sha256"]) == 64, receipt
+assert len(receipt["celix_subject_sha256"]) == 64, receipt
+assert len(receipt["celix_bundles"]) == 2, receipt
+assert len(receipt["celix_containers"]) == 1, receipt
+
+service = next(
+    bundle for bundle in receipt["celix_bundles"]
+    if bundle["reference"] == service_ref
+)
+assert service["activator"] == "libdemo_activator.so", service
+assert len(service["bundle_content_sha256"]) == 64, service
+assert len(service["archive_sha256"]) == 64, service
+assert len(service["manifest_sha256"]) == 64, service
+
+composition = receipt["celix_containers"][0]
+assert len(composition["composition_sha256"]) == 64, composition
+assert composition["bundles"][0]["bundle"] == service_ref, composition
+assert composition["bundles"][0]["level"] == 1, composition
+assert composition["bundles"][1]["bundle"] == config_ref, composition
+assert composition["bundles"][1]["level"] == 3, composition
+
+assert celix_provenance["schema"].endswith("/celix-runtime/v1"), celix_provenance
+assert celix_provenance["subject_sha256"] == receipt["celix_subject_sha256"], (
+    celix_provenance,
+    receipt,
+)
+assert len(celix_provenance["subject_sha256"]) == 64, celix_provenance
+assert len(celix_provenance["bundle_set_sha256"]) == 64, celix_provenance
+assert len(celix_provenance["container_set_sha256"]) == 64, celix_provenance
+assert len(celix_provenance["bundles"]) == 2, celix_provenance
+assert len(celix_provenance["containers"]) == 1, celix_provenance
+
 rebuild = provenance["rebuilds"][0]
 assert rebuild["reference"] == "zlib/1.3.1", rebuild
 assert rebuild["repeatable"] is True, rebuild
@@ -96,4 +266,7 @@ print(repeatability["summary"])
 print(reproduction["summary"])
 print("consumed payload:", rebuild["consumed_payload_sha256"])
 print("clean rebuild payload:", rebuild["rebuild_payload_sha256"][0])
+print("Celix subject:", receipt["celix_subject_sha256"])
+print("Celix service content:", service["bundle_content_sha256"])
+print("Celix composition:", composition["composition_sha256"])
 PY

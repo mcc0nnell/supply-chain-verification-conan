@@ -4,6 +4,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 MODULE = pathlib.Path(__file__).parents[1] / "extensions" / "commands" / "cmd_assurance.py"
@@ -11,6 +12,47 @@ SPEC = importlib.util.spec_from_file_location("cmd_assurance", MODULE)
 assurance = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = assurance
 SPEC.loader.exec_module(assurance)
+
+
+def _write_celix_bundle(
+    path,
+    *,
+    symbolic="example.bundle",
+    version="1.2.3",
+    activator="libexample.so",
+    private_libraries=(),
+    extra_members=None,
+    timestamp=(2026, 1, 1, 0, 0, 0),
+    reverse=False,
+):
+    manifest = {
+        "CELIX_BUNDLE_SYMBOLIC_NAME": symbolic,
+        "CELIX_BUNDLE_VERSION": f"version<{version}>",
+        "CELIX_BUNDLE_NAME": symbolic,
+        "CELIX_BUNDLE_MANIFEST_VERSION": "version<2.0.0>",
+    }
+    if activator:
+        manifest["CELIX_BUNDLE_ACTIVATOR_LIBRARY"] = activator
+    if private_libraries:
+        manifest["CELIX_BUNDLE_PRIVATE_LIBRARIES"] = list(private_libraries)
+
+    members = [
+        ("META-INF/MANIFEST.json", json.dumps(manifest, sort_keys=True).encode()),
+    ]
+    if activator:
+        members.append((activator, b"activator-bytes"))
+    for library in private_libraries:
+        members.append((library, f"private:{library}".encode()))
+    if extra_members:
+        members.extend(extra_members)
+    if reverse:
+        members.reverse()
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members:
+            info = zipfile.ZipInfo(name, date_time=timestamp)
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, data)
 
 
 class AssuranceTests(unittest.TestCase):
@@ -271,6 +313,139 @@ class AssuranceTests(unittest.TestCase):
         digest1 = assurance.evidence_digest(evidence)
         digest2 = assurance.evidence_digest(list(reversed(evidence)))
         self.assertEqual(digest1, digest2)
+
+    def test_celix_bundle_payload_is_stable_across_zip_order_and_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            first = root / "first.zip"
+            second = root / "second.zip"
+            _write_celix_bundle(
+                first,
+                private_libraries=("libprivate.so",),
+                timestamp=(2026, 1, 1, 0, 0, 0),
+            )
+            _write_celix_bundle(
+                second,
+                private_libraries=("libprivate.so",),
+                timestamp=(2026, 9, 18, 12, 0, 0),
+                reverse=True,
+            )
+
+            first_record, first_evidence = assurance._inspect_celix_bundle(first)
+            second_record, second_evidence = assurance._inspect_celix_bundle(second)
+
+        self.assertEqual(
+            first_record.bundle_content_sha256,
+            second_record.bundle_content_sha256,
+        )
+        self.assertNotEqual(first_record.archive_sha256, second_record.archive_sha256)
+        self.assertEqual(first_record.reference, "celix-bundle:example.bundle@1.2.3")
+        self.assertTrue(all(item.status == "PASS" for item in first_evidence))
+        self.assertTrue(all(item.status == "PASS" for item in second_evidence))
+
+    def test_celix_bundle_content_matches_fineract_celix_v1_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "golden.zip"
+            _write_celix_bundle(
+                path,
+                private_libraries=("libprivate.so",),
+                extra_members=[("resources/config.json", b'{"mode":"demo"}')],
+            )
+            record, _ = assurance._inspect_celix_bundle(path)
+
+        # Cross-checked against fineract-celix
+        # fcr::sha256BundleContent (fcr.bundle-content.v1).
+        self.assertEqual(
+            record.bundle_content_sha256,
+            "6e838b18b5a3bebddd3303547c41903b3e48b68d12fdd0dea7a51802b9859aed",
+        )
+
+    def test_celix_manifest_fails_when_declared_activator_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "broken.zip"
+            manifest = {
+                "CELIX_BUNDLE_SYMBOLIC_NAME": "broken.bundle",
+                "CELIX_BUNDLE_VERSION": "version<1.0.0>",
+                "CELIX_BUNDLE_MANIFEST_VERSION": "version<2.0.0>",
+                "CELIX_BUNDLE_ACTIVATOR_LIBRARY": "libmissing.so",
+            }
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "META-INF/MANIFEST.json",
+                    json.dumps(manifest),
+                )
+
+            record, evidence = assurance._inspect_celix_bundle(path)
+
+        closure_evidence = next(
+            item for item in evidence if item.check == "celix-library-closure"
+        )
+        self.assertEqual(record.symbolic_name, "broken.bundle")
+        self.assertEqual(closure_evidence.status, "FAIL")
+        self.assertIn("libmissing.so", closure_evidence.summary)
+
+    def test_celix_archive_layout_rejects_parent_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "unsafe.zip"
+            _write_celix_bundle(
+                path,
+                extra_members=[("../escape.so", b"bad")],
+            )
+
+            _, evidence = assurance._inspect_celix_bundle(path)
+
+        layout = next(
+            item for item in evidence if item.check == "celix-archive-layout"
+        )
+        payload = next(
+            item for item in evidence if item.check == "celix-bundle-content"
+        )
+        self.assertEqual(layout.status, "FAIL")
+        self.assertEqual(payload.status, "FAIL")
+        self.assertIn("unsafe bundle member path", layout.summary)
+
+    def test_celix_container_composition_binds_start_level_and_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            first_path = root / "alpha.zip"
+            second_path = root / "beta.zip"
+            _write_celix_bundle(
+                first_path,
+                symbolic="alpha.bundle",
+                version="1.0.0",
+                activator="libalpha.so",
+            )
+            _write_celix_bundle(
+                second_path,
+                symbolic="beta.bundle",
+                version="2.0.0",
+                activator="libbeta.so",
+            )
+            _, bundles = assurance.inspect_celix_bundles(
+                [str(first_path), str(second_path)],
+                [],
+            )
+
+            config = root / "config.properties"
+            config.write_text(
+                "CELIX_AUTO_START_1=alpha.zip,beta.zip\n"
+                "CELIX_AUTO_INSTALL=beta.zip\n",
+                encoding="utf-8",
+            )
+            evidence, records = assurance.inspect_celix_containers(
+                [str(config)],
+                bundles,
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(evidence[0].status, "PASS")
+        self.assertEqual(len(records[0].bundles), 3)
+        self.assertEqual(records[0].bundles[0]["level"], 1)
+        self.assertEqual(records[0].bundles[0]["order"], 0)
+        self.assertEqual(records[0].bundles[0]["bundle"], "celix-bundle:alpha.bundle@1.0.0")
+        self.assertEqual(records[0].bundles[1]["bundle"], "celix-bundle:beta.bundle@2.0.0")
+        self.assertEqual(records[0].bundles[2]["mode"], "auto-install")
+        self.assertEqual(len(records[0].composition_sha256), 64)
 
     def test_summary_counts_statuses(self):
         evidence = [
