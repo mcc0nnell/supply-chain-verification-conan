@@ -459,6 +459,7 @@ def _source_artifact_evidence(
 
     verified_locations: list[str] = []
     verified_count = 0
+    mismatch_count = 0
 
     for entry in entries:
         digest = entry.get("sha256")
@@ -481,6 +482,7 @@ def _source_artifact_evidence(
 
         expected = digest.lower()
         last_problem = "all source mirrors were unavailable"
+        entry_mismatches = 0
 
         for url in urls:
             try:
@@ -505,16 +507,15 @@ def _source_artifact_evidence(
                 continue
 
             if actual != expected:
-                return Evidence(
-                    reference,
-                    "source-artifact-bytes",
-                    "FAIL",
-                    (
-                        "downloaded source SHA-256 mismatch: "
-                        f"expected {expected}, got {actual}"
-                    ),
-                    (url, f"sha256:{expected}", f"sha256:{actual}"),
+                mismatch_count += 1
+                entry_mismatches += 1
+                verified_locations.extend(
+                    [url, f"mismatch-sha256:{actual}"]
                 )
+                last_problem = (
+                    "source SHA-256 mismatch at every available mirror"
+                )
+                continue
 
             verified_count += 1
             verified_locations.extend(
@@ -525,20 +526,29 @@ def _source_artifact_evidence(
             return Evidence(
                 reference,
                 "source-artifact-bytes",
-                "UNKNOWN",
+                "FAIL" if entry_mismatches else "UNKNOWN",
                 last_problem,
-                tuple(urls + [f"sha256:{expected}"]),
+                tuple(verified_locations + urls + [f"sha256:{expected}"]),
             )
+
+    if mismatch_count:
+        summary = (
+            "downloaded source bytes match declared SHA-256; "
+            f"{mismatch_count} alternate mirror mismatch(es) were rejected"
+        )
+    elif verified_count == 1:
+        summary = "downloaded source bytes match declared SHA-256"
+    else:
+        summary = (
+            f"{verified_count} downloaded source artifacts "
+            "match declared SHA-256"
+        )
 
     return Evidence(
         reference,
         "source-artifact-bytes",
         "PASS",
-        (
-            "downloaded source bytes match declared SHA-256"
-            if verified_count == 1
-            else f"{verified_count} downloaded source artifacts match declared SHA-256"
-        ),
+        summary,
         tuple(verified_locations),
     )
 

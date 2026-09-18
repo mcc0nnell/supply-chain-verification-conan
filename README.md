@@ -2,7 +2,7 @@
 
 A Conan 2 custom command that turns a resolved C/C++ dependency graph into explicit, machine-enforceable supply-chain evidence.
 
-**Current release:** `v0.3.0`
+**Current release:** `v0.3.1`
 
 ```bash
 conan assurance --requires=zlib/1.3.1 -r=conancenter
@@ -193,7 +193,7 @@ Useful options:
 
 This project does **not** replace `conan audit`, and it does not treat a successful clean rebuild as universal reproducibility.
 
-The source-artifact check verifies the bytes obtained from a declared source mirror against the recipe's declared SHA-256. A mismatch is a hard `FAIL`; unreachable mirrors remain `UNKNOWN`.
+The source-artifact check verifies bytes from the recipe's declared mirrors against the declared SHA-256. If one mirror returns mismatched bytes, the check tries the remaining declared mirrors; a matching fallback can still establish the expected source artifact while recording the rejected mismatch. If every available mirror mismatches, the result is a hard `FAIL`; unreachable mirrors remain `UNKNOWN`.
 
 The package check hashes the package tree Conan actually materialized in its local cache and binds that digest to the package ID and revision selected by the graph. Clean rebuild verification then asks two separate questions: whether repeated clean builds under the recorded builder environment agree with each other, and whether that output matches the package payload Conan consumed.
 
