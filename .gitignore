@@ -1,0 +1,4 @@
+.demo-conan-home/
+demo/
+__pycache__/
+*.pyc
