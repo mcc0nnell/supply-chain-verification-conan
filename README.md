@@ -2,13 +2,13 @@
 
 A Conan 2 custom command that turns a resolved C/C++ dependency graph into explicit, machine-enforceable supply-chain evidence.
 
-**Current release:** `v0.3.1`
+**Current release:** `v0.4.0`
 
 ```bash
 conan assurance --requires=zlib/1.3.1 -r=conancenter
 ```
 
-The command complements Conan's built-in vulnerability audit and SBOM tooling. It focuses on recipe identity, source bytes, package bytes, upstream project posture, and deterministic evidence receipts.
+The command complements Conan's built-in vulnerability audit and SBOM tooling. It focuses on recipe identity, source bytes, package bytes, upstream project posture, deterministic evidence receipts, and now Apache Celix bundle/runtime composition.
 
 ## Checks
 
@@ -86,6 +86,40 @@ Each rebuild runs in a fresh Conan home using the same recipe revision and profi
 
 The resulting predicate records the consumed payload digest, every clean rebuild payload digest, recipe/package revisions, rebuild log digests, and the observed builder toolchain. A PASS for `rebuild-repeatability` means the clean builds agree with each other. A separate PASS for `consumed-binary-reproduction` is required before claiming they reproduce the package Conan consumed.
 
+## Apache Celix bundle and runtime assurance
+
+Celix bundles are ZIP archives with a JSON manifest and, commonly, an activator/shared libraries. v0.4.0 makes those runtime artifacts first-class assurance subjects instead of stopping at the Conan package graph.
+
+```bash
+conan assurance \
+  --requires=zlib/1.3.1 \
+  --celix-bundle-dir=build-celix \
+  --celix-container-config=build-celix/deploy/MyContainer/config.properties \
+  --receipt=receipt.json \
+  --celix-provenance=celix-provenance.json
+```
+
+Bundle discovery only treats ZIPs containing `META-INF/MANIFEST.json` as Celix bundles. Each bundle receives four checks:
+
+- **celix-archive-layout** — rejects path traversal, duplicate normalized member paths, and symlinks that escape the bundle root.
+- **celix-manifest** — binds `CELIX_BUNDLE_SYMBOLIC_NAME`, bundle version, manifest version, and the manifest digest.
+- **celix-library-closure** — verifies every manifest-declared activator/private library exists in the bundle.
+- **celix-bundle-content** — computes a canonical content digest independent of ZIP entry order and archive timestamps while also recording the exact ZIP SHA-256.
+
+The canonical bundle-content digest follows the same `fcr.bundle-content.v1` length-prefixed file-content contract used by the existing `fineract-celix` assurance implementation. That lets the Conan-side evidence and Celix-side runtime evidence refer to the same bundle identity.
+
+A **celix-bundle-set** observation then binds the ordered set of symbolic-name/version identities to their canonical content digests.
+
+For Celix JSON snapshots or ordinary `.properties` framework/container configuration, `--celix-container-config` reads `CELIX_AUTO_START_0` through `CELIX_AUTO_START_6` plus `CELIX_AUTO_INSTALL`. The resulting **celix-container-composition** digest preserves start level, declaration order, symbolic bundle identity, and bundle content digest. Missing or ambiguous bundle references are a `FAIL`.
+
+The Celix predicate type is:
+
+```text
+https://windanvil.com/predicates/celix-runtime/v1
+```
+
+Its subject digest binds the bundle set and configured runtime composition. Release-tag CI signs that subject with GitHub's short-lived OIDC/Sigstore attestation flow alongside the Conan rebuild attestation.
+
 ## Signed provenance
 
 Release-tag CI uses GitHub's Sigstore-backed artifact attestation action to sign the custom Conan rebuild predicate against the consumed package payload digest. The predicate type is:
@@ -104,9 +138,11 @@ Requirements: Python 3.10+ and Conan 2.32+.
 ./scripts/demo.sh
 ```
 
-The demo resolves and materializes `zlib/1.3.1` from ConanCenter, verifies source/package bytes, and performs two independent clean-cache rebuilds. It produces seven observations: the original five plus rebuild repeatability and consumed-binary reproduction.
+The demo resolves and materializes `zlib/1.3.1` from ConanCenter, verifies source/package bytes, performs two independent clean-cache rebuilds, and builds a small Celix-format runtime fixture containing one real shared-library activator bundle plus one resource-only bundle.
 
-On the current Ubuntu/GCC 13 demonstration environment, the two clean rebuilds are byte-for-byte repeatable at the package-payload level, while their payload differs from the ConanCenter package selected by the same package ID. The command reports that distinction as one PASS and one FAIL instead of collapsing both questions into a single provenance claim.
+On the current Ubuntu/GCC 13 demonstration environment, the two zlib clean rebuilds are byte-for-byte repeatable at the package-payload level, while their payload differs from the ConanCenter package selected by the same package ID. That remains an intentional FAIL.
+
+The Celix side verifies both bundle manifests/layouts/library closure, computes canonical bundle identities, binds the two bundles into a start-level-aware container composition, and emits a separate runtime predicate. The full demo currently produces 17 observations: 16 PASS / 1 FAIL / 0 UNKNOWN.
 
 It writes:
 
@@ -115,18 +151,17 @@ demo/assurance.json
 demo/assurance.ndjson
 demo/receipt.json
 demo/provenance.json
+demo/celix-provenance.json
+demo/celix/bundles/demo_service.zip
+demo/celix/bundles/demo_config.zip
 ```
 ## Evidence receipt
 
-The JSON receipt contains a stable graph digest and evidence digest plus one bound record per resolved package. A package record includes:
+The v2 JSON receipt contains the Conan graph digest, an overall subject digest, the evidence digest, package records, Celix bundle records, and Celix container-composition records.
 
-- recipe revision
-- package ID and package revision
-- resolved settings and options
-- recomputed source-artifact SHA-256 when verified
-- complete package-tree SHA-256 when verified
-- package-payload SHA-256 used for clean rebuild comparison
-- status and summary for every check
+A Conan package record includes recipe/package revisions, resolved settings/options, source-artifact SHA-256, complete package-tree SHA-256, package-payload SHA-256, and check summaries.
+
+A Celix bundle record includes symbolic name/version, manifest and exact archive digests, canonical bundle-content digest, activator/private-library declarations, and every member digest. Container records bind the configuration-file digest to the ordered start/install composition.
 
 The receipt is written before policy enforcement, so failed CI still leaves evidence to inspect.
 
@@ -180,6 +215,10 @@ Useful options:
 | `--rebuild-package` | — | Rebuild a resolved name/version in independent clean Conan homes; repeatable |
 | `--rebuild-count` | `2` | Number of clean rebuild attempts; minimum 2 when enabled |
 | `--rebuild-timeout` | `900` | Timeout per clean rebuild in seconds |
+| `--celix-bundle` | — | Inspect an explicit Celix bundle ZIP; repeatable |
+| `--celix-bundle-dir` | — | Discover Celix bundle ZIPs recursively; repeatable |
+| `--celix-container-config` | — | Bind a Celix JSON or `.properties` runtime configuration; repeatable |
+| `--celix-provenance` | — | Write a Celix runtime-composition predicate suitable for attestation |
 | `--minimum-scorecard-score` | `-1` | Optional minimum Scorecard score; negative disables threshold enforcement |
 | `--scorecard-timeout` | `5` | Scorecard network timeout in seconds |
 | `--skip-scorecard` | off | Disable Scorecard network lookup |
