@@ -2,7 +2,9 @@ import importlib.util
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 MODULE = pathlib.Path(__file__).parents[1] / "extensions" / "commands" / "cmd_assurance.py"
 SPEC = importlib.util.spec_from_file_location("cmd_assurance", MODULE)
@@ -69,6 +71,124 @@ class AssuranceTests(unittest.TestCase):
         }
         item = assurance._source_digest_evidence("demo/1.0", node)
         self.assertEqual(item.status, "FAIL")
+
+
+    def test_source_artifact_bytes_pass_on_matching_download(self):
+        expected = "a" * 64
+        node = {
+            "name": "demo",
+            "version": "1.0",
+            "conandata": {
+                "sources": {
+                    "1.0": {
+                        "url": "https://example.test/demo-1.0.tar.gz",
+                        "sha256": expected,
+                    }
+                }
+            },
+        }
+        with mock.patch.object(
+            assurance,
+            "_download_sha256",
+            return_value=(expected, 1234),
+        ):
+            item = assurance._source_artifact_evidence(
+                "demo/1.0",
+                node,
+                timeout=1,
+                max_bytes=4096,
+            )
+
+        self.assertEqual(item.status, "PASS")
+        self.assertIn(f"sha256:{expected}", item.locations)
+        self.assertIn("bytes:1234", item.locations)
+
+    def test_source_artifact_bytes_fail_on_mismatch(self):
+        node = {
+            "name": "demo",
+            "version": "1.0",
+            "conandata": {
+                "sources": {
+                    "1.0": {
+                        "url": "https://example.test/demo-1.0.tar.gz",
+                        "sha256": "a" * 64,
+                    }
+                }
+            },
+        }
+        with mock.patch.object(
+            assurance,
+            "_download_sha256",
+            return_value=("b" * 64, 1234),
+        ):
+            item = assurance._source_artifact_evidence(
+                "demo/1.0",
+                node,
+                timeout=1,
+                max_bytes=4096,
+            )
+
+        self.assertEqual(item.status, "FAIL")
+        self.assertIn("mismatch", item.summary)
+
+    def test_package_tree_digest_binds_paths_and_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "include").mkdir()
+            (root / "lib").mkdir()
+            (root / "include" / "demo.h").write_text("hello\n", encoding="utf-8")
+            (root / "lib" / "libdemo.a").write_bytes(b"archive")
+            digest1 = assurance._package_tree_digest(root)
+            digest2 = assurance._package_tree_digest(root)
+
+        self.assertEqual(digest1, digest2)
+        self.assertEqual(digest1[1], 2)
+        self.assertEqual(digest1[2], 13)
+        self.assertEqual(len(digest1[0]), 64)
+
+    def test_receipt_binds_graph_source_and_package_digests(self):
+        source_sha = "1" * 64
+        package_sha = "2" * 64
+        graph = {
+            "nodes": {
+                "1": {
+                    "ref": "demo/1.0#rrev",
+                    "name": "demo",
+                    "version": "1.0",
+                    "rrev": "rrev",
+                    "package_id": "pkgid",
+                    "prev": "prev",
+                    "context": "host",
+                    "settings": {"os": "Linux"},
+                    "options": {"shared": "False"},
+                }
+            }
+        }
+        evidence = [
+            assurance.Evidence(
+                "demo/1.0",
+                "source-artifact-bytes",
+                "PASS",
+                "verified",
+                (f"sha256:{source_sha}",),
+            ),
+            assurance.Evidence(
+                "demo/1.0",
+                "package-bytes",
+                "PASS",
+                "verified",
+                (f"sha256:{package_sha}",),
+            ),
+        ]
+
+        identity = assurance.graph_identity(graph)
+        packages = assurance._receipt_packages(identity, evidence)
+
+        self.assertEqual(packages[0]["recipe_revision"], "rrev")
+        self.assertEqual(packages[0]["package_id"], "pkgid")
+        self.assertEqual(packages[0]["package_revision"], "prev")
+        self.assertEqual(packages[0]["source_artifact_sha256"], source_sha)
+        self.assertEqual(packages[0]["package_tree_sha256"], package_sha)
 
     def test_graph_inspection_is_deterministic_without_network(self):
         graph = {
