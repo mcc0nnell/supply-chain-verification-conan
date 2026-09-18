@@ -131,6 +131,39 @@ class AssuranceTests(unittest.TestCase):
         self.assertEqual(item.status, "FAIL")
         self.assertIn("mismatch", item.summary)
 
+    def test_source_artifact_bytes_uses_matching_fallback_mirror(self):
+        expected = "a" * 64
+        node = {
+            "name": "demo",
+            "version": "1.0",
+            "conandata": {
+                "sources": {
+                    "1.0": {
+                        "url": [
+                            "https://mirror-one.test/demo.tar.gz",
+                            "https://mirror-two.test/demo.tar.gz",
+                        ],
+                        "sha256": expected,
+                    }
+                }
+            },
+        }
+        with mock.patch.object(
+            assurance,
+            "_download_sha256",
+            side_effect=[("b" * 64, 100), (expected, 100)],
+        ):
+            item = assurance._source_artifact_evidence(
+                "demo/1.0",
+                node,
+                timeout=1,
+                max_bytes=4096,
+            )
+
+        self.assertEqual(item.status, "PASS")
+        self.assertIn("alternate mirror mismatch", item.summary)
+        self.assertIn(f"sha256:{expected}", item.locations)
+
     def test_package_tree_digest_binds_paths_and_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
