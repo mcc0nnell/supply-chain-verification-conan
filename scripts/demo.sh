@@ -139,7 +139,22 @@ conan assurance \
   --celix-provenance="$ROOT/demo/celix-provenance.json" \
   --format=json > "$ROOT/demo/assurance.json"
 
-python3 - "$ROOT/demo/assurance.json" "$ROOT/demo/receipt.json" "$ROOT/demo/provenance.json" "$ROOT/demo/celix-provenance.json" <<'PY'
+conan assurance \
+  --celix-only \
+  --celix-bundle-dir="$ROOT/demo/celix/bundles" \
+  --celix-container-config="$ROOT/demo/celix/config.properties" \
+  --receipt="$ROOT/demo/celix-only-receipt.json" \
+  --celix-provenance="$ROOT/demo/celix-only-provenance.json" \
+  --format=json > "$ROOT/demo/celix-only.json"
+
+python3 - \
+  "$ROOT/demo/assurance.json" \
+  "$ROOT/demo/receipt.json" \
+  "$ROOT/demo/provenance.json" \
+  "$ROOT/demo/celix-provenance.json" \
+  "$ROOT/demo/celix-only.json" \
+  "$ROOT/demo/celix-only-receipt.json" \
+  "$ROOT/demo/celix-only-provenance.json" <<'PY'
 import json
 import sys
 
@@ -147,10 +162,16 @@ path = sys.argv[1]
 receipt_path = sys.argv[2]
 provenance_path = sys.argv[3]
 celix_provenance_path = sys.argv[4]
+celix_only_path = sys.argv[5]
+celix_only_receipt_path = sys.argv[6]
+celix_only_provenance_path = sys.argv[7]
 data = json.load(open(path, encoding="utf-8"))
 receipt = json.load(open(receipt_path, encoding="utf-8"))
 provenance = json.load(open(provenance_path, encoding="utf-8"))
 celix_provenance = json.load(open(celix_provenance_path, encoding="utf-8"))
+celix_only = json.load(open(celix_only_path, encoding="utf-8"))
+celix_only_receipt = json.load(open(celix_only_receipt_path, encoding="utf-8"))
+celix_only_provenance = json.load(open(celix_only_provenance_path, encoding="utf-8"))
 items = data["evidence"]
 
 def find(check):
@@ -210,7 +231,12 @@ container = next(
     item for item in items
     if item["check"] == "celix-container-composition"
 )
+collision = next(
+    item for item in items
+    if item["check"] == "celix-runtime-library-collision"
+)
 assert container["status"] == "PASS", container
+assert collision["status"] == "PASS", collision
 assert data["packages"] == 1, data
 assert data["celix_bundles"] == 2, data
 assert data["celix_containers"] == 1, data
@@ -248,6 +274,20 @@ assert len(celix_provenance["bundle_set_sha256"]) == 64, celix_provenance
 assert len(celix_provenance["container_set_sha256"]) == 64, celix_provenance
 assert len(celix_provenance["bundles"]) == 2, celix_provenance
 assert len(celix_provenance["containers"]) == 1, celix_provenance
+
+assert celix_only["packages"] == 0, celix_only
+assert celix_only["celix_bundles"] == 2, celix_only
+assert celix_only["celix_containers"] == 1, celix_only
+assert celix_only["counts"]["FAIL"] == 0, celix_only
+assert celix_only["counts"]["UNKNOWN"] == 0, celix_only
+assert (
+    celix_only_receipt["celix_subject_sha256"]
+    == receipt["celix_subject_sha256"]
+), (celix_only_receipt, receipt)
+assert (
+    celix_only_provenance["subject_sha256"]
+    == celix_provenance["subject_sha256"]
+), (celix_only_provenance, celix_provenance)
 
 rebuild = provenance["rebuilds"][0]
 assert rebuild["reference"] == "zlib/1.3.1", rebuild

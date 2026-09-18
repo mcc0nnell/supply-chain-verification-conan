@@ -22,7 +22,9 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
       - run: python -m unittest discover -s tests -v
-      - run: chmod +x scripts/demo.sh && ./scripts/demo.sh
+      - run: chmod +x scripts/demo.sh scripts/celix_collision_demo.sh
+      - run: ./scripts/demo.sh
+      - run: ./scripts/celix_collision_demo.sh
       - run: |
           test -s demo/assurance.json
           test -s demo/assurance.ndjson
@@ -39,6 +41,7 @@ jobs:
           grep -q '"reference":"celix-bundle:demo.config@1.0.0"' demo/assurance.ndjson
           grep -q '"check":"celix-bundle-content"' demo/assurance.ndjson
           grep -q '"check":"celix-container-composition"' demo/assurance.ndjson
+          grep -q '"check":"celix-runtime-library-collision"' demo/assurance.ndjson
           grep -q '"package_payload_sha256"' demo/receipt.json
           grep -q '"celix_subject_sha256"' demo/receipt.json
           grep -q '"repeatable": true' demo/provenance.json

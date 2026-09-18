@@ -55,6 +55,52 @@ def _write_celix_bundle(
             archive.writestr(info, data)
 
 
+def _minimal_elf64_with_soname(soname: str) -> bytes:
+    dynstr = b"\x00" + soname.encode("utf-8") + b"\x00"
+    dynstr_offset = 64
+    dynamic_offset = 96
+    section_offset = 128
+    total = section_offset + 3 * 64
+    data = bytearray(total)
+
+    data[:4] = b"\x7fELF"
+    data[4] = 2  # ELFCLASS64
+    data[5] = 1  # little endian
+    data[6] = 1  # ELF version
+    import struct
+    struct.pack_into("<Q", data, 40, section_offset)
+    struct.pack_into("<H", data, 52, 64)
+    struct.pack_into("<H", data, 58, 64)
+    struct.pack_into("<H", data, 60, 3)
+    struct.pack_into("<H", data, 62, 0)
+
+    data[dynstr_offset:dynstr_offset + len(dynstr)] = dynstr
+    struct.pack_into("<qQ", data, dynamic_offset, 14, 1)
+    struct.pack_into("<qQ", data, dynamic_offset + 16, 0, 0)
+
+    dynstr_header = section_offset + 64
+    struct.pack_into(
+        "<IIQQQQIIQQ",
+        data,
+        dynstr_header,
+        0, 3, 0, 0,
+        dynstr_offset,
+        len(dynstr),
+        0, 0, 1, 0,
+    )
+    dynamic_header = section_offset + 128
+    struct.pack_into(
+        "<IIQQQQIIQQ",
+        data,
+        dynamic_header,
+        0, 6, 0, 0,
+        dynamic_offset,
+        32,
+        1, 0, 8, 16,
+    )
+    return bytes(data)
+
+
 class AssuranceTests(unittest.TestCase):
     def test_github_release_url_resolves(self):
         self.assertEqual(
@@ -314,6 +360,133 @@ class AssuranceTests(unittest.TestCase):
         digest2 = assurance.evidence_digest(list(reversed(evidence)))
         self.assertEqual(digest1, digest2)
 
+    def test_elf_soname_parser_reads_dynamic_soname(self):
+        data = _minimal_elf64_with_soname("libcollision.so.1")
+        self.assertEqual(
+            assurance._elf_soname(data),
+            "libcollision.so.1",
+        )
+
+    def test_celix_soname_collision_detects_divergent_runtime_libraries(self):
+        first = assurance.CelixBundleRecord(
+            path="/tmp/alpha.zip",
+            symbolic_name="alpha.bundle",
+            version="1.0.0",
+            manifest_version="2.0.0",
+            activator="libalpha.so",
+            private_libraries=("libshared-a.so",),
+            library_sonames=(("libshared-a.so", "libshared.so.1"),),
+            archive_sha256="a" * 64,
+            bundle_content_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+            members=(("libshared-a.so", "3" * 64),),
+        )
+        second = assurance.CelixBundleRecord(
+            path="/tmp/beta.zip",
+            symbolic_name="beta.bundle",
+            version="1.0.0",
+            manifest_version="2.0.0",
+            activator="libbeta.so",
+            private_libraries=("libshared-b.so",),
+            library_sonames=(("libshared-b.so", "libshared.so.1"),),
+            archive_sha256="b" * 64,
+            bundle_content_sha256="4" * 64,
+            manifest_sha256="5" * 64,
+            members=(("libshared-b.so", "6" * 64),),
+        )
+
+        collisions = assurance._celix_soname_collisions([first, second])
+
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0]["soname"], "libshared.so.1")
+        self.assertEqual(len(collisions[0]["libraries"]), 2)
+
+    def test_celix_soname_collision_allows_identical_library_bytes(self):
+        common_sha = "7" * 64
+        first = assurance.CelixBundleRecord(
+            path="/tmp/alpha.zip",
+            symbolic_name="alpha.bundle",
+            version="1.0.0",
+            manifest_version="2.0.0",
+            activator=None,
+            private_libraries=("libshared-a.so",),
+            library_sonames=(("libshared-a.so", "libshared.so.1"),),
+            archive_sha256="a" * 64,
+            bundle_content_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+            members=(("libshared-a.so", common_sha),),
+        )
+        second = assurance.CelixBundleRecord(
+            path="/tmp/beta.zip",
+            symbolic_name="beta.bundle",
+            version="1.0.0",
+            manifest_version="2.0.0",
+            activator=None,
+            private_libraries=("libshared-b.so",),
+            library_sonames=(("libshared-b.so", "libshared.so.1"),),
+            archive_sha256="b" * 64,
+            bundle_content_sha256="4" * 64,
+            manifest_sha256="5" * 64,
+            members=(("libshared-b.so", common_sha),),
+        )
+
+        self.assertEqual(
+            assurance._celix_soname_collisions([first, second]),
+            [],
+        )
+
+    def test_celix_container_fails_on_divergent_soname_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = root / "config.properties"
+            config.write_text(
+                "CELIX_AUTO_START_1=alpha.zip,beta.zip\n",
+                encoding="utf-8",
+            )
+
+            alpha = assurance.CelixBundleRecord(
+                path=str(root / "alpha.zip"),
+                symbolic_name="alpha.bundle",
+                version="1.0.0",
+                manifest_version="2.0.0",
+                activator=None,
+                private_libraries=("libalpha.so",),
+                library_sonames=(("libalpha.so", "libshared.so.1"),),
+                archive_sha256="a" * 64,
+                bundle_content_sha256="1" * 64,
+                manifest_sha256="2" * 64,
+                members=(("libalpha.so", "3" * 64),),
+            )
+            beta = assurance.CelixBundleRecord(
+                path=str(root / "beta.zip"),
+                symbolic_name="beta.bundle",
+                version="1.0.0",
+                manifest_version="2.0.0",
+                activator=None,
+                private_libraries=("libbeta.so",),
+                library_sonames=(("libbeta.so", "libshared.so.1"),),
+                archive_sha256="b" * 64,
+                bundle_content_sha256="4" * 64,
+                manifest_sha256="5" * 64,
+                members=(("libbeta.so", "6" * 64),),
+            )
+
+            evidence, _ = assurance.inspect_celix_containers(
+                [str(config)],
+                [alpha, beta],
+            )
+
+        collision = next(
+            item
+            for item in evidence
+            if item.check == "celix-runtime-library-collision"
+        )
+        self.assertEqual(collision.status, "FAIL")
+        self.assertIn("SONAME collision", collision.summary)
+        self.assertTrue(
+            any("libshared.so.1" in location for location in collision.locations)
+        )
+
     def test_celix_bundle_payload_is_stable_across_zip_order_and_timestamps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -446,6 +619,41 @@ class AssuranceTests(unittest.TestCase):
         self.assertEqual(records[0].bundles[1]["bundle"], "celix-bundle:beta.bundle@2.0.0")
         self.assertEqual(records[0].bundles[2]["mode"], "auto-install")
         self.assertEqual(len(records[0].composition_sha256), 64)
+
+    def test_celix_generated_container_source_parses_embedded_json(self):
+        source = """
+#include <celix_launcher.h>
+#define CELIX_MULTI_LINE_STRING(...) #__VA_ARGS__
+
+int main(int argc, char *argv[]) {
+    const char * config = CELIX_MULTI_LINE_STRING(
+{
+    "CELIX_AUTO_START_1":"alpha.zip,beta.zip",
+    "CELIX_BUNDLES_PATH":"bundles",
+    "CELIX_CONTAINER_NAME":"AssuranceContainer"
+});
+    return celix_launcher_launchAndWait(argc, argv, config);
+}
+"""
+        config = assurance._extract_celix_embedded_json(source)
+        self.assertEqual(
+            config["CELIX_AUTO_START_1"],
+            "alpha.zip,beta.zip",
+        )
+        self.assertEqual(config["CELIX_BUNDLES_PATH"], "bundles")
+        self.assertEqual(config["CELIX_CONTAINER_NAME"], "AssuranceContainer")
+
+    def test_celix_generated_container_source_handles_braces_in_strings(self):
+        source = r'''
+const char * config = CELIX_MULTI_LINE_STRING(
+{
+    "CELIX_AUTO_START_3":"alpha.zip",
+    "custom":"literal { braces } and \"quote\""
+});
+'''
+        config = assurance._extract_celix_embedded_json(source)
+        self.assertEqual(config["CELIX_AUTO_START_3"], "alpha.zip")
+        self.assertEqual(config["custom"], 'literal { braces } and "quote"')
 
     def test_summary_counts_statuses(self):
         evidence = [

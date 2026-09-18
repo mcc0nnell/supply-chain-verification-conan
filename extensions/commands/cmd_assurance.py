@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 import urllib.error
@@ -65,6 +66,7 @@ class CelixBundleRecord:
     manifest_version: str
     activator: str | None
     private_libraries: tuple[str, ...]
+    library_sonames: tuple[tuple[str, str], ...]
     archive_sha256: str
     bundle_content_sha256: str
     manifest_sha256: str
@@ -83,6 +85,10 @@ class CelixBundleRecord:
             "manifest_version": self.manifest_version,
             "activator": self.activator,
             "private_libraries": list(self.private_libraries),
+            "library_sonames": [
+                {"path": path, "soname": soname}
+                for path, soname in self.library_sonames
+            ],
             "archive_sha256": self.archive_sha256,
             "bundle_content_sha256": self.bundle_content_sha256,
             "manifest_sha256": self.manifest_sha256,
@@ -256,6 +262,11 @@ def assurance(conan_api, parser, *args):
         help="Write a custom predicate for Celix bundle identities and container composition",
     )
     parser.add_argument(
+        "--celix-only",
+        action="store_true",
+        help="Inspect Celix runtime artifacts without resolving a Conan dependency graph",
+    )
+    parser.add_argument(
         "--fail-on-failure",
         action="store_true",
         help="Return non-zero when any check returns FAIL",
@@ -287,6 +298,25 @@ def assurance(conan_api, parser, *args):
         raise ConanException(
             "--celix-provenance requires --celix-bundle or --celix-bundle-dir"
         )
+    if parsed.celix_only and not (
+        parsed.celix_bundle
+        or parsed.celix_bundle_dir
+        or parsed.celix_container_config
+    ):
+        raise ConanException(
+            "--celix-only requires Celix bundle or container input"
+        )
+    if parsed.celix_only and (
+        parsed.requires
+        or parsed.tool_requires
+        or parsed.rebuild_package
+        or parsed.materialize_packages
+        or parsed.verify_package_bytes
+        or parsed.verify_source_bytes
+    ):
+        raise ConanException(
+            "--celix-only cannot be combined with Conan graph/build verification options"
+        )
     if parsed.rebuild_package:
         parsed.materialize_packages = True
         parsed.verify_package_bytes = True
@@ -297,30 +327,34 @@ def assurance(conan_api, parser, *args):
             "so package bytes are present in the Conan cache"
         )
 
-    if parsed.materialize_packages:
-        with tempfile.TemporaryDirectory(prefix="conan-assurance-") as output_folder:
-            install_result = conan_api.command.run(
-                _install_command(parsed, output_folder)
-            )
-        if install_result.get("conan_error"):
-            raise ConanException(install_result["conan_error"])
+    serialized = {"nodes": {}}
+    evidence: list[Evidence] = []
 
-    graph_result = conan_api.command.run(_graph_command(parsed))
-    if graph_result.get("conan_error"):
-        raise ConanException(graph_result["conan_error"])
+    if not parsed.celix_only:
+        if parsed.materialize_packages:
+            with tempfile.TemporaryDirectory(prefix="conan-assurance-") as output_folder:
+                install_result = conan_api.command.run(
+                    _install_command(parsed, output_folder)
+                )
+            if install_result.get("conan_error"):
+                raise ConanException(install_result["conan_error"])
 
-    serialized = graph_result["graph"].serialize()
-    evidence = inspect_graph(
-        serialized,
-        conan_api=conan_api,
-        minimum_scorecard_score=parsed.minimum_scorecard_score,
-        scorecard_timeout=parsed.scorecard_timeout,
-        skip_scorecard=parsed.skip_scorecard,
-        verify_source_bytes=parsed.verify_source_bytes,
-        source_timeout=parsed.source_timeout,
-        source_max_bytes=parsed.source_max_bytes,
-        verify_package_bytes=parsed.verify_package_bytes,
-    )
+        graph_result = conan_api.command.run(_graph_command(parsed))
+        if graph_result.get("conan_error"):
+            raise ConanException(graph_result["conan_error"])
+
+        serialized = graph_result["graph"].serialize()
+        evidence = inspect_graph(
+            serialized,
+            conan_api=conan_api,
+            minimum_scorecard_score=parsed.minimum_scorecard_score,
+            scorecard_timeout=parsed.scorecard_timeout,
+            skip_scorecard=parsed.skip_scorecard,
+            verify_source_bytes=parsed.verify_source_bytes,
+            source_timeout=parsed.source_timeout,
+            source_max_bytes=parsed.source_max_bytes,
+            verify_package_bytes=parsed.verify_package_bytes,
+        )
     rebuild_records = []
     if parsed.rebuild_package:
         rebuild_evidence, rebuild_records = verify_reproducible_builds(
@@ -1390,10 +1424,20 @@ def _inspect_celix_bundle(
                 missing.append(library)
 
         members: list[tuple[str, str]] = []
+        info_by_name: dict[str, zipfile.ZipInfo] = {}
         for info in sorted(infos, key=lambda item: item.filename.replace("\\", "/")):
             normalized = info.filename.replace("\\", "/")
             data = archive.read(info)
+            info_by_name[normalized] = info
             members.append((normalized, hashlib.sha256(data).hexdigest()))
+
+        library_sonames: list[tuple[str, str]] = []
+        for normalized, info in sorted(info_by_name.items()):
+            if _zip_info_is_symlink(info):
+                continue
+            soname = _elf_soname(archive.read(info))
+            if soname:
+                library_sonames.append((normalized, soname))
 
         bundle_content_sha = _celix_bundle_content_sha256(archive, infos)
 
@@ -1405,6 +1449,7 @@ def _inspect_celix_bundle(
         manifest_version=manifest_version,
         activator=activator,
         private_libraries=private_libraries,
+        library_sonames=tuple(sorted(library_sonames)),
         archive_sha256=archive_sha,
         bundle_content_sha256=bundle_content_sha,
         manifest_sha256=manifest_sha,
@@ -1499,6 +1544,105 @@ def _sha256_add_length_prefixed(digest, value: bytes) -> None:
 def _zip_info_is_symlink(info: zipfile.ZipInfo) -> bool:
     mode = (info.external_attr >> 16) & 0xFFFF
     return stat.S_ISLNK(mode)
+
+
+def _elf_soname(data: bytes) -> str | None:
+    """Return DT_SONAME from a well-formed ELF object, if present."""
+    if len(data) < 16 or data[:4] != b"\x7fELF":
+        return None
+
+    elf_class = data[4]
+    data_encoding = data[5]
+    if data_encoding == 1:
+        endian = "<"
+    elif data_encoding == 2:
+        endian = ">"
+    else:
+        return None
+
+    try:
+        if elf_class == 1:
+            section_offset = struct.unpack_from(endian + "I", data, 32)[0]
+            section_entry_size = struct.unpack_from(endian + "H", data, 46)[0]
+            section_count = struct.unpack_from(endian + "H", data, 48)[0]
+            section_format = endian + "IIIIIIIIII"
+            dynamic_format = endian + "iI"
+        elif elf_class == 2:
+            section_offset = struct.unpack_from(endian + "Q", data, 40)[0]
+            section_entry_size = struct.unpack_from(endian + "H", data, 58)[0]
+            section_count = struct.unpack_from(endian + "H", data, 60)[0]
+            section_format = endian + "IIQQQQIIQQ"
+            dynamic_format = endian + "qQ"
+        else:
+            return None
+
+        section_size = struct.calcsize(section_format)
+        dynamic_size = struct.calcsize(dynamic_format)
+        if (
+            section_count == 0
+            or section_entry_size < section_size
+            or section_offset > len(data)
+        ):
+            return None
+
+        sections: list[tuple[int, int, int, int, int]] = []
+        for index in range(section_count):
+            offset = section_offset + index * section_entry_size
+            if offset + section_size > len(data):
+                return None
+            values = struct.unpack_from(section_format, data, offset)
+            section_type = int(values[1])
+            file_offset = int(values[4])
+            byte_size = int(values[5])
+            link = int(values[6])
+            entry_size = int(values[9])
+            sections.append((
+                section_type,
+                file_offset,
+                byte_size,
+                link,
+                entry_size,
+            ))
+
+        for section_type, file_offset, byte_size, link, entry_size in sections:
+            if section_type != 6:  # SHT_DYNAMIC
+                continue
+            if link < 0 or link >= len(sections):
+                return None
+            if file_offset + byte_size > len(data):
+                return None
+
+            _, string_offset, string_size, _, _ = sections[link]
+            if string_offset + string_size > len(data):
+                return None
+
+            stride = entry_size or dynamic_size
+            if stride < dynamic_size:
+                return None
+            position = file_offset
+            end = file_offset + byte_size
+            while position + dynamic_size <= end:
+                tag, value = struct.unpack_from(dynamic_format, data, position)
+                if tag == 0:  # DT_NULL
+                    break
+                if tag == 14:  # DT_SONAME
+                    if value < 0 or value >= string_size:
+                        return None
+                    start = string_offset + int(value)
+                    limit = string_offset + string_size
+                    nul = data.find(b"\x00", start, limit)
+                    if nul < 0:
+                        return None
+                    try:
+                        soname = data[start:nul].decode("utf-8")
+                    except UnicodeDecodeError:
+                        return None
+                    return soname or None
+                position += stride
+    except (IndexError, OverflowError, struct.error, ValueError):
+        return None
+
+    return None
 
 
 def _celix_archive_layout_errors(
@@ -1603,6 +1747,50 @@ def _display_path(path: Path) -> str:
         return path.resolve().as_posix()
 
 
+def _celix_soname_collisions(
+    bundles: Iterable[CelixBundleRecord],
+) -> list[dict]:
+    by_soname: dict[str, list[dict]] = {}
+    seen: set[tuple[str, str, str]] = set()
+
+    for bundle in bundles:
+        member_digests = dict(bundle.members)
+        for member_path, soname in bundle.library_sonames:
+            digest = member_digests.get(member_path)
+            if not digest:
+                continue
+            identity = (bundle.reference, member_path, digest)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            by_soname.setdefault(soname, []).append({
+                "bundle": bundle.reference,
+                "path": member_path,
+                "sha256": digest,
+            })
+
+    collisions: list[dict] = []
+    for soname, libraries in sorted(by_soname.items()):
+        artifacts = {
+            (item["bundle"], item["path"])
+            for item in libraries
+        }
+        digests = {item["sha256"] for item in libraries}
+        if len(artifacts) > 1 and len(digests) > 1:
+            collisions.append({
+                "soname": soname,
+                "libraries": sorted(
+                    libraries,
+                    key=lambda item: (
+                        item["bundle"],
+                        item["path"],
+                        item["sha256"],
+                    ),
+                ),
+            })
+    return collisions
+
+
 def inspect_celix_containers(
     config_paths: list[str],
     bundles: list[CelixBundleRecord],
@@ -1653,6 +1841,7 @@ def inspect_celix_containers(
 
         declared = _celix_configured_bundle_locations(config)
         entries: list[dict] = []
+        resolved_bundles: list[CelixBundleRecord] = []
         unresolved: list[str] = []
         ambiguous: list[str] = []
 
@@ -1685,6 +1874,7 @@ def inspect_celix_containers(
                 })
                 continue
 
+            resolved_bundles.append(bundle)
             entries.append({
                 "mode": mode,
                 "level": level,
@@ -1739,6 +1929,43 @@ def inspect_celix_containers(
             tuple(locations),
         ))
 
+        collisions = _celix_soname_collisions(resolved_bundles)
+        if collisions:
+            collision_status = "FAIL"
+            collision_summary = (
+                f"runtime composition contains {len(collisions)} divergent "
+                "ELF SONAME collision(s)"
+            )
+        elif unresolved or ambiguous:
+            collision_status = "UNKNOWN"
+            collision_summary = (
+                "runtime library collision check is incomplete because "
+                "one or more configured bundles were unresolved"
+            )
+        else:
+            collision_status = "PASS"
+            collision_summary = (
+                "no divergent ELF SONAME collisions across configured bundles"
+            )
+
+        collision_locations = [_display_path(path)]
+        for collision in collisions:
+            soname = collision["soname"]
+            for library in collision["libraries"]:
+                collision_locations.append(
+                    "soname:"
+                    f"{soname}:{library['bundle']}:{library['path']}:"
+                    f"{library['sha256']}"
+                )
+
+        evidence.append(Evidence(
+            record.reference,
+            "celix-runtime-library-collision",
+            collision_status,
+            collision_summary,
+            tuple(collision_locations),
+        ))
+
     records.sort(key=lambda item: item.path)
     evidence.sort(key=lambda item: (item.reference, item.check))
     return evidence, records
@@ -1752,6 +1979,16 @@ def _read_celix_container_config(path: Path) -> dict:
         if not isinstance(value, dict):
             raise ValueError("Celix JSON config must be an object")
         return value
+
+    embedded = _extract_celix_embedded_json(text)
+    if embedded is not None:
+        return embedded
+
+    if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx"}:
+        raise ValueError(
+            "Celix generated container source does not contain "
+            "CELIX_MULTI_LINE_STRING JSON"
+        )
 
     config: dict[str, str] = {}
     pending = ""
@@ -1788,6 +2025,69 @@ def _read_celix_container_config(path: Path) -> dict:
     if pending:
         raise ValueError("Celix properties config ends with an unfinished continuation")
     return config
+
+
+def _extract_celix_embedded_json(text: str) -> dict | None:
+    marker = "CELIX_MULTI_LINE_STRING"
+    search_from = 0
+    start = None
+
+    while True:
+        marker_at = text.find(marker, search_from)
+        if marker_at < 0:
+            return None
+
+        open_paren = text.find("(", marker_at + len(marker))
+        if open_paren < 0:
+            raise ValueError("malformed CELIX_MULTI_LINE_STRING invocation")
+
+        candidate = open_paren + 1
+        while candidate < len(text) and text[candidate].isspace():
+            candidate += 1
+        if candidate < len(text) and text[candidate] == "{":
+            start = candidate
+            break
+
+        search_from = open_paren + 1
+
+    if start is None:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    end = None
+
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+            if depth < 0:
+                raise ValueError("malformed embedded Celix JSON")
+
+    if end is None:
+        raise ValueError("unterminated embedded Celix JSON object")
+
+    value = json.loads(text[start:end])
+    if not isinstance(value, dict):
+        raise ValueError("embedded Celix JSON config must be an object")
+    return value
 
 
 def _celix_configured_bundle_locations(
@@ -1950,6 +2250,10 @@ def _celix_bundle_identity(bundle: CelixBundleRecord) -> dict:
         "manifest_version": bundle.manifest_version,
         "activator": bundle.activator,
         "private_libraries": list(bundle.private_libraries),
+        "library_sonames": [
+            {"path": path, "soname": soname}
+            for path, soname in bundle.library_sonames
+        ],
         "archive_sha256": bundle.archive_sha256,
         "bundle_content_sha256": bundle.bundle_content_sha256,
         "manifest_sha256": bundle.manifest_sha256,

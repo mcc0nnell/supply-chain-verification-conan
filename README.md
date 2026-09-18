@@ -2,7 +2,7 @@
 
 A Conan 2 custom command that turns a resolved C/C++ dependency graph into explicit, machine-enforceable supply-chain evidence.
 
-**Current release:** `v0.4.0`
+**Current release:** `v0.5.0`
 
 ```bash
 conan assurance --requires=zlib/1.3.1 -r=conancenter
@@ -88,16 +88,20 @@ The resulting predicate records the consumed payload digest, every clean rebuild
 
 ## Apache Celix bundle and runtime assurance
 
-Celix bundles are ZIP archives with a JSON manifest and, commonly, an activator/shared libraries. v0.4.0 makes those runtime artifacts first-class assurance subjects instead of stopping at the Conan package graph.
+Celix bundles are ZIP archives with a JSON manifest and, commonly, an activator/shared libraries. v0.5.0 makes those runtime artifacts first-class assurance subjects and also checks a Celix-specific dynamic-linker identity hazard.
 
 ```bash
 conan assurance \
-  --requires=zlib/1.3.1 \
+  --celix-only \
   --celix-bundle-dir=build-celix \
   --celix-container-config=build-celix/deploy/MyContainer/config.properties \
   --receipt=receipt.json \
   --celix-provenance=celix-provenance.json
 ```
+
+`--celix-only` skips Conan graph resolution entirely, so the command can be used against a native Celix build even when that application does not use Conan for its own dependency management.
+
+For runtime composition, `--celix-container-config` accepts normal JSON snapshots, `.properties` files created with Celix `USE_CONFIG`, or generated C/C++ launcher source containing Celix's `CELIX_MULTI_LINE_STRING({...})` embedded framework configuration. That covers both of Celix's normal container configuration paths.
 
 Bundle discovery only treats ZIPs containing `META-INF/MANIFEST.json` as Celix bundles. Each bundle receives four checks:
 
@@ -111,6 +115,8 @@ The canonical bundle-content digest follows the same `fcr.bundle-content.v1` len
 A **celix-bundle-set** observation then binds the ordered set of symbolic-name/version identities to their canonical content digests.
 
 For Celix JSON snapshots or ordinary `.properties` framework/container configuration, `--celix-container-config` reads `CELIX_AUTO_START_0` through `CELIX_AUTO_START_6` plus `CELIX_AUTO_INSTALL`. The resulting **celix-container-composition** digest preserves start level, declaration order, symbolic bundle identity, and bundle content digest. Missing or ambiguous bundle references are a `FAIL`.
+
+Celix's own bundle documentation notes that `dlopen` can reuse an already-loaded shared library when the ELF `NEEDED` / `SONAME` identity matches. That means two bundles can carry different bytes under the same `DT_SONAME`, yet one bundle may execute the other's library. The **celix-runtime-library-collision** check parses SONAMEs from regular ELF members in every configured bundle and returns `FAIL` when the same SONAME is backed by divergent bytes. Identical bytes under the same SONAME are allowed.
 
 The Celix predicate type is:
 
@@ -142,7 +148,7 @@ The demo resolves and materializes `zlib/1.3.1` from ConanCenter, verifies sourc
 
 On the current Ubuntu/GCC 13 demonstration environment, the two zlib clean rebuilds are byte-for-byte repeatable at the package-payload level, while their payload differs from the ConanCenter package selected by the same package ID. That remains an intentional FAIL.
 
-The Celix side verifies both bundle manifests/layouts/library closure, computes canonical bundle identities, binds the two bundles into a start-level-aware container composition, and emits a separate runtime predicate. The full demo currently produces 17 observations: 16 PASS / 1 FAIL / 0 UNKNOWN.
+The Celix side verifies both bundle manifests/layouts/library closure, computes canonical bundle identities, parses the real activator ELF SONAME, checks the runtime for divergent SONAME collisions, binds the two bundles into a start-level-aware container composition, and emits a separate runtime predicate. The full demo currently produces 18 observations: 17 PASS / 1 FAIL / 0 UNKNOWN.
 
 It writes:
 
@@ -161,7 +167,7 @@ The v2 JSON receipt contains the Conan graph digest, an overall subject digest, 
 
 A Conan package record includes recipe/package revisions, resolved settings/options, source-artifact SHA-256, complete package-tree SHA-256, package-payload SHA-256, and check summaries.
 
-A Celix bundle record includes symbolic name/version, manifest and exact archive digests, canonical bundle-content digest, activator/private-library declarations, and every member digest. Container records bind the configuration-file digest to the ordered start/install composition.
+A Celix bundle record includes symbolic name/version, manifest and exact archive digests, canonical bundle-content digest, activator/private-library declarations, parsed ELF SONAME mappings, and every member digest. Container records bind the configuration-file digest to the ordered start/install composition and emit a separate runtime-library collision result.
 
 The receipt is written before policy enforcement, so failed CI still leaves evidence to inspect.
 
@@ -217,8 +223,9 @@ Useful options:
 | `--rebuild-timeout` | `900` | Timeout per clean rebuild in seconds |
 | `--celix-bundle` | — | Inspect an explicit Celix bundle ZIP; repeatable |
 | `--celix-bundle-dir` | — | Discover Celix bundle ZIPs recursively; repeatable |
-| `--celix-container-config` | — | Bind a Celix JSON or `.properties` runtime configuration; repeatable |
+| `--celix-container-config` | — | Bind a Celix JSON, `.properties`, or generated launcher-source runtime configuration; repeatable |
 | `--celix-provenance` | — | Write a Celix runtime-composition predicate suitable for attestation |
+| `--celix-only` | off | Inspect Celix runtime artifacts without resolving a Conan graph |
 | `--minimum-scorecard-score` | `-1` | Optional minimum Scorecard score; negative disables threshold enforcement |
 | `--scorecard-timeout` | `5` | Scorecard network timeout in seconds |
 | `--skip-scorecard` | off | Disable Scorecard network lookup |
